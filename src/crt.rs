@@ -1,14 +1,14 @@
-// crt.rs — эффект выключения ЭЛТ-телевизора.
+// crt.rs — CRT-TV power-off effect.
 //
-// Пять фаз анимации по нормированному времени t ∈ [0,1]:
+// Five animation phases over normalized time t ∈ [0,1]:
 //   Static → Collapse → Line → Dot → Flash
-// (см. docs/superpowers/specs/2026-08-12-crt-tv-off-design.md, §2).
+// (see docs/superpowers/specs/2026-08-12-crt-tv-off-design.md, §2).
 //
-// Рендер-модель — как в ufo.rs: overlay-grid Vec<Option<Ov>> + маска burned,
-// один write_all на кадр. Ключевое отличие: burned = vec![true; cols*rows]
-// с первого кадра Static (помехи полностью заменяют сигнал), и не сбрасывается
-// в false при ресайзе после Static — иначе вне полосы всплывёт оригинальный
-// текст терминала.
+// Render model mirrors ufo.rs: an overlay grid Vec<Option<Ov>> plus a burned
+// mask, one write_all per frame. Key difference: burned = vec![true;
+// cols*rows] from the very first Static frame (noise fully replaces the
+// signal) and is never reset to false on resize after Static — otherwise the
+// original terminal text would leak back in outside the active band.
 
 use crate::engine::{terminal_size, Rng};
 use crate::palettes::Palette;
@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Фазы анимации CRT-выключения (§2 спеки). Порядок важен — monotonic по t.
+/// CRT power-off animation phases (spec §2). Order matters — monotonic in t.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
     Static,
@@ -28,36 +28,37 @@ pub enum Phase {
     Flash,
 }
 
-/// Границы фаз как полуоткрытые интервалы [lo, hi) (§2). Flash включает t == 1.0.
+/// Phase boundaries as half-open intervals [lo, hi) (spec §2). Flash includes t == 1.0.
 const PHASE_STATIC_END: f32 = 0.18;
 const PHASE_COLLAPSE_END: f32 = 0.50;
 const PHASE_LINE_END: f32 = 0.58;
 const PHASE_DOT_END: f32 = 0.78;
-// PHASE_FLASH_END = 1.0 (неявно).
+// PHASE_FLASH_END = 1.0 (implicit).
 
-// ── Overlay cell + grid-примитивы (как в ufo.rs) ──────────────────────
+// ── Overlay cell + grid primitives (as in ufo.rs) ─────────────────────
 
 #[derive(Clone, Copy)]
 struct Ov {
     ch: char,
-    color: Option<(u8, u8, u8)>, // None ⇒ default fg/bg (используется для erase-пробела)
+    color: Option<(u8, u8, u8)>, // None ⇒ default fg/bg (used for the erase space)
 }
 
-/// Поставить ячейку overlay в grid по координатам, с проверкой границ.
+/// Place an overlay cell into the grid at the given coordinates, bounds-checked.
 fn stamp(grid: &mut [Option<Ov>], cols: i32, rows: i32, x: i32, y: i32, ov: Ov) {
     if (0..cols).contains(&x) && (0..rows).contains(&y) {
         grid[(y as usize) * (cols as usize) + (x as usize)] = Some(ov);
     }
 }
 
-// Примечание: в отличие от ufo.rs, функции `burn()` здесь НЕТ. В CRT `burned`
-// всегда all-true (инвариант §3.2: весь экран принадлежит эффекту с первого
-// кадра Static), поэтому помечать отдельные ячейки не нужно — Layer-1 стирает
-// весь экран безусловно. Добавлять `burn()` не надо: она стала бы dead_code.
+// Note: unlike ufo.rs there is no `burn()` here. In CRT `burned` is always
+// all-true (invariant §3.2: the whole screen belongs to the effect from the
+// first Static frame), so marking individual cells is pointless — Layer-1
+// erases the whole screen unconditionally. Do not add `burn()`: it would be
+// dead_code.
 
-/// Индекс/тип фазы по нормированному времени (0..=1).
-/// Конвенция границ: [lo, hi); phase_at(0.18) → Collapse, phase_at(0.50) → Line
-/// и т.д. При t == 1.0 → Flash.
+/// Phase index/kind by normalized time (0..=1).
+/// Boundary convention: [lo, hi); phase_at(0.18) → Collapse, phase_at(0.50)
+/// → Line, etc. At t == 1.0 → Flash.
 pub fn phase_at(t01: f32) -> Phase {
     let t = t01.clamp(0.0, 1.0);
     if t < PHASE_STATIC_END {
@@ -73,44 +74,45 @@ pub fn phase_at(t01: f32) -> Phase {
     }
 }
 
-/// Easing-фактор для схлопывания: (1-p)^0.5. Удержание полного размера
-/// большую часть фазы → стремительное смыкание к концу (§3.6). При p == 1.0
-/// даёт 0, что потом clamp'ится до 1 в вызове.
+/// Collapse easing factor: (1-p)^0.5. Holds the full size for most of the
+/// phase, then snaps shut rapidly near the end (spec §3.6). At p == 1.0 it
+/// yields 0, which the caller then clamps up to 1.
 fn ease_hold_then_snap(p: f32) -> f32 {
     (1.0_f32 - p.clamp(0.0, 1.0)).max(0.0).sqrt()
 }
 
-/// Применить easing к полному размеру → текущий размер, не менее 1.
+/// Apply easing to a full size → current size, no less than 1.
 fn ease_size(p: f32, full: usize) -> usize {
     let raw = (full as f32 * ease_hold_then_snap(p)).round() as usize;
     raw.max(1)
 }
 
-/// Активная высота вертикальной полосы на фазе Collapse (§4). Монотонно не
-/// возрастает по p; на p == 0 → full, на p == 1 → 1.
+/// Active height of the vertical band during the Collapse phase (spec §4).
+/// Monotonically non-increasing in p; at p == 0 → full, at p == 1 → 1.
 pub fn collapse_height(p: f32, full: usize) -> usize {
     ease_size(p, full)
 }
 
-/// Длина горизонтальной линии на фазе Dot (§4). Семантически идентична
-/// collapse_height — вынесено в отдельное имя для читаемости точки вызова.
+/// Length of the horizontal line during the Dot phase (spec §4). Semantically
+/// identical to collapse_height — split out as a separate name for readability
+/// at the call site.
 pub fn line_width(p: f32, full: usize) -> usize {
     ease_size(p, full)
 }
 
-/// Строки активной вертикальной полосы высотой `h` вокруг центра `cy`.
-/// Возвращает полуоткрытый диапазон [top, top+h), центрированный по cy
-/// (целочисленное деление: top = cy - h/2, насыщаясь до 0). Решает
-/// неоднозначность чётного h единообразно — нижняя граница сдвигается вверх.
-/// Clamp сверху (до rows) делает вызывающий код в run().
+/// Rows of the active vertical band of height `h` centered on `cy`. Returns
+/// the half-open range [top, top+h) centered on cy (integer division:
+/// top = cy - h/2, saturating at 0). Resolves the even-h ambiguity uniformly
+/// — the lower edge shifts up. The caller clamps the upper bound to `rows`
+/// in run().
 pub fn collapse_band(cy: usize, h: usize) -> (usize, usize) {
     let top = cy.saturating_sub(h / 2);
     (top, top + h)
 }
 
-/// Взвешенная таблица глифов помех (§3.5): ' '×2, '░'×3, '▒'×3, '▓'×2, '█'×2.
-/// Длина = сумма весов = 12. Порядок не важен для визуального эффекта, но
-/// фиксируется для тестируемости.
+/// Weighted noise glyph table (spec §3.5): ' '×2, '░'×3, '▒'×3, '▓'×2, '█'×2.
+/// Length = sum of weights = 12. Order does not matter for the visual effect
+/// but is fixed for testability.
 const GLYPH_TABLE: &[char] = &[
     ' ', ' ',
     '░', '░', '░',
@@ -120,25 +122,25 @@ const GLYPH_TABLE: &[char] = &[
 ];
 const GLYPH_TABLE_LEN: usize = GLYPH_TABLE.len();
 
-/// Символ шума по индексу во взвешенной таблице (§4). Безопасен для любого
-/// idx: берётся по модулю длины, чтобы инклюзивный Rng::range (см. R3) не
-/// мог выйти за границы. Для idx ∈ [0, GLYPH_TABLE_LEN) эквивалентно прямому
-/// индексу — это и проверяется в тесте.
+/// Noise symbol by index into the weighted table (spec §4). Safe for any idx:
+/// taken modulo the length, so the inclusive Rng::range (see R3) can never go
+/// out of bounds. For idx ∈ [0, GLYPH_TABLE_LEN) it is equivalent to a direct
+/// index — which is exactly what the test checks.
 pub fn glyph_at(idx: usize) -> char {
     GLYPH_TABLE[idx % GLYPH_TABLE_LEN]
 }
 
-/// Perceived luminance по ITU-R BT.601: 0.299·R + 0.587·G + 0.114·B.
-/// Чистая функция — используется только в brightest().
+/// Perceived luminance per ITU-R BT.601: 0.299·R + 0.587·G + 0.114·B.
+/// Pure function — only used inside brightest().
 fn luminance(c: (u8, u8, u8)) -> f32 {
     0.299 * c.0 as f32 + 0.587 * c.1 as f32 + 0.114 * c.2 as f32
 }
 
-/// Самая яркая ступень палитры по perceived luminance (§3.3/§4). Это цвет
-/// финальной вспышки (Flash). Универсальна для любого --from/--to: для дефолтной
-/// огневой палитры (тёмный→яркий) совпадает с palette[36]; для инвертированной
-/// --from "#00f0ff" --to "#002080" — с бирюзовым концом (индекс 0). NOT хардкод
-/// palette[36].
+/// Brightest palette step by perceived luminance (spec §3.3/§4). This is the
+/// color of the final Flash. Works for any --from/--to: for the default fire
+/// palette (dark→bright) it coincides with palette[36]; for the inverted
+/// --from "#00f0ff" --to "#002080" it is the cyan end (index 0). NOT a
+/// palette[36] hardcode.
 pub fn brightest(palette: &Palette) -> (u8, u8, u8) {
     let mut best = palette[0];
     let mut best_lum = luminance(palette[0]);
@@ -152,31 +154,32 @@ pub fn brightest(palette: &Palette) -> (u8, u8, u8) {
     best
 }
 
-/// Один глиф шума: символ + цвет (§3.5). ' ' возвращает (0,0,0) — вызывающий
-/// код пропускает отрисовку пробела (дыры в шуме). Цвет: '█' → чистый белый;
-/// '░▒▓' → серый с равными каналами в диапазоне 170..=240; ' ' → любой
-/// (всё равно не рисуется). Сам выбор случаен и нетестируем, но опирается на
-/// детерминированную glyph_at (§4).
+/// One noise glyph: symbol + color (spec §3.5). The caller never stamps
+/// spaces (they leave the erase layer visible as a noise hole), so only the
+/// actually-drawn glyphs need a meaningful color: '█' → pure white, '░▒▓' →
+/// equal-channel gray in 170..=240. The choice itself is random and not under
+/// test, but it leans on the deterministic glyph_at (spec §4).
 fn static_glyph(rng: &mut Rng) -> (char, (u8, u8, u8)) {
-    // Инклюзивный Rng::range может вернуть GLYPH_TABLE_LEN; glyph_at берёт по
-    // модулю, поэтому безопасен (см. R3).
+    // Inclusive Rng::range may return GLYPH_TABLE_LEN; glyph_at takes it
+    // modulo the length, so it is always safe (see R3).
     let idx = rng.range(0, GLYPH_TABLE_LEN as i32) as usize;
     let ch = glyph_at(idx);
-    let color = match ch {
-        ' ' => (0, 0, 0),
-        '█' => (255, 255, 255),
-        _ => {
-            let v = rng.range(170, 240) as u8;
-            (v, v, v)
-        }
+    // Spaces are never stamped by the caller, so their color is unobserved —
+    // collapse into a single gray arm instead of carrying a dead ' ' branch.
+    // '█' is the only special case.
+    let color = if ch == '█' {
+        (255, 255, 255)
+    } else {
+        let v = rng.range(170, 240) as u8;
+        (v, v, v)
     };
     (ch, color)
 }
 
-/// Рендер overlay-grid в один String с последующим write_all (как в ufo.rs).
-/// None-ячейки пропускаются — на их месте остаётся оригинальный текст терминала
-/// (но в CRT весь экран после Static помечен burned, поэтому erase в run()
-/// сначала закроет их пробелом).
+/// Render the overlay grid into a single String followed by write_all (as in
+/// ufo.rs). None cells are skipped — the original terminal text would show
+/// through there (but in CRT the whole screen is marked burned after Static,
+/// so the erase pass in run() blanks them first).
 fn render(buf: &mut String, grid: &[Option<Ov>], cols: usize, rows: usize) {
     use std::fmt::Write as _;
     buf.clear();
@@ -193,7 +196,7 @@ fn render(buf: &mut String, grid: &[Option<Ov>], cols: usize, rows: usize) {
             };
             if need_move || wrow != y || wcol != x {
                 let _ = write!(buf, "{ESC}[{};{}H", y + 1, x + 1);
-                last_color = None; // после move цвет нужно переизлучить
+                last_color = None; // color must be re-emitted after a cursor move
                 need_move = false;
                 wrow = y;
                 wcol = x;
@@ -216,32 +219,38 @@ fn render(buf: &mut String, grid: &[Option<Ov>], cols: usize, rows: usize) {
     let _ = write!(buf, "{ESC}[0m");
 }
 
-// ── Главный цикл ──────────────────────────────────────────────────────
+// ── Main loop ──────────────────────────────────────────────────────────
 
 pub fn run(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicBool>) {
     let (mut cols, mut rows) = terminal_size();
-    // Слишком мелко — main() всё равно сделает final clear.
+    // Too small to bother — main() does the final clear anyway.
     if cols < 8 || rows < 4 {
         return;
     }
     let fps = settings.fps.max(1) as u64;
     let frame_delay = Duration::from_millis(1000 / fps);
-    // CRT clamp'ит длительность снизу до 0.5 c (новое для CRT, §7) — иначе фазы
-    // могут схлопнуться в <1 кадр. engine::burn и ufo::run этого не делают.
+    // CRT clamps the duration from below to 0.5 s (new for CRT, spec §7) —
+    // otherwise phases could collapse to <1 frame. engine::burn and ufo::run
+    // do not do this.
     let t = Duration::from_secs_f32(settings.duration.max(0.5));
 
     let mut rng = Rng::new();
-    // burned всегда all-true: с первого кадра (p=0 ⇒ фаза Static) весь экран
-    // принадлежит эффекту — помехи полностью заменяют сигнал (инвариант §3.2).
-    // Поэтому Layer-1 ниже стирает весь экран каждый кадр, а активная зона Layer-2
-    // перерисовывается поверх. Никогда не сбрасывать в vec![false] (в т.ч. ресайз).
+    // burned is always all-true: from the very first frame (p=0 ⇒ Static
+    // phase) the whole screen belongs to the effect — noise fully replaces
+    // the signal (invariant §3.2). So Layer-1 below erases the whole screen
+    // every frame, and the Layer-2 active zone is drawn on top. Never reset
+    // this to vec![false] (including on resize).
     let mut burned = vec![true; cols * rows];
     let mut grid: Vec<Option<Ov>> = vec![None; cols * rows];
     let mut buf = String::with_capacity(cols * rows * 6);
 
+    // Brightest palette step — precomputed once and reused by the Flash
+    // branch every frame, instead of re-scanning all 37 steps per frame.
+    let flash_base = brightest(palette);
+
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    let _ = write!(out, "{ESC}[?25l"); // спрятать курсор
+    let _ = write!(out, "{ESC}[?25l"); // hide cursor
     let _ = out.flush();
 
     let start = Instant::now();
@@ -254,8 +263,9 @@ pub fn run(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicBo
             break;
         }
 
-        // Live resize. burned всегда пересоздаётся как vec![true] (инвариант
-        // §3.2/§7) — иначе вне активной полосы всплывёт оригинальный текст.
+        // Live resize. burned is always recreated as vec![true] (invariant
+        // §3.2/§7) — otherwise the original text would leak back in outside
+        // the active band.
         let (nc, nr) = terminal_size();
         if nc != cols || nr != rows {
             cols = nc;
@@ -269,20 +279,21 @@ pub fn run(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicBo
         }
         let (ci, ri) = (cols as i32, rows as i32);
 
-        // Сброс overlay на этот кадр.
+        // Reset the overlay for this frame.
         for cell in grid.iter_mut() {
             *cell = None;
         }
 
-        // Нормированное время кадра.
+        // Normalized frame time.
         let p = (elapsed.as_secs_f32() / t.as_secs_f32()).clamp(0.0, 1.0);
         let phase = phase_at(p);
         let cy = rows / 2;
         let cx = cols / 2;
 
-        // Layer 1: erase — закрыть пробелом весь экран (burned всегда all-true,
-        // инвариант §3.2). Активная зона Layer 2 перерисуется поверх; ' '-дыры
-        // шума в Static остаются erase-пробелом (текст под ними не просвечивает).
+        // Layer 1: erase — blank out the whole screen (burned is always
+        // all-true, invariant §3.2). The Layer-2 active zone redraws on top;
+        // the ' ' holes in Static noise stay as erase spaces (the text under
+        // them never shows through).
         for y in 0..ri {
             for x in 0..ci {
                 if burned[(y as usize) * cols + (x as usize)] {
@@ -291,11 +302,12 @@ pub fn run(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicBo
             }
         }
 
-        // Layer 2: активная зона текущей фазы (рисуется поверх erase).
+        // Layer 2: the active zone of the current phase (drawn over the erase).
         match phase {
             Phase::Static => {
-                // burned уже all-true — пометки не требуется. Рисуем плотный
-                // мерцающий шум; ' '-дыры не stamp'аются и остаются erase-пробелом.
+                // burned is already all-true — no marking needed. Draw dense
+                // flickering noise; ' ' holes are not stamped and stay as the
+                // erase space.
                 for y in 0..ri {
                     for x in 0..ci {
                         let (ch, color) = static_glyph(&mut rng);
@@ -306,7 +318,7 @@ pub fn run(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicBo
                 }
             }
             Phase::Collapse => {
-                // Локальный прогресс фазы: 0 на границе 0.18, 1 на границе 0.50.
+                // Local phase progress: 0 at the 0.18 boundary, 1 at the 0.50 boundary.
                 let pp = ((p - PHASE_STATIC_END) / (PHASE_COLLAPSE_END - PHASE_STATIC_END))
                     .clamp(0.0, 1.0);
                 let h = collapse_height(pp, rows);
@@ -322,13 +334,13 @@ pub fn run(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicBo
                 }
             }
             Phase::Line => {
-                // Одна центральная строка — сплошная яркая белая линия.
+                // One central row — a solid bright white line.
                 for x in 0..ci {
                     stamp(&mut grid, ci, ri, x, cy as i32, Ov { ch: '█', color: Some((255, 255, 255)) });
                 }
             }
             Phase::Dot => {
-                // Линия сжимается по горизонтали к центру.
+                // The line contracts horizontally toward the center.
                 let pp = ((p - PHASE_LINE_END) / (PHASE_DOT_END - PHASE_LINE_END))
                     .clamp(0.0, 1.0);
                 let w = line_width(pp, cols);
@@ -339,18 +351,22 @@ pub fn run(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicBo
                 }
             }
             Phase::Flash => {
-                // Ячейка (cx,cy): короткая белая вспышка → brightest(palette) →
-                // линейное затухание яркости до нуля.
+                // Cell (cx,cy): a short white flash → flash_base (brightest
+                // palette step) → linear brightness fade to zero. The fade is
+                // renormalized onto the visible segment (spec §5): the first
+                // 20% is pure white, then flash_base decays from full
+                // intensity at pp=0.2 down to 0 at pp=1.0 — so the brightest
+                // color is actually shown at full strength instead of 0.8,
+                // and the white→base transition is continuous.
                 let pp = ((p - PHASE_DOT_END) / (1.0 - PHASE_DOT_END)).clamp(0.0, 1.0);
                 let c = if pp < 0.2 {
                     (255, 255, 255)
                 } else {
-                    let base = brightest(palette);
-                    let k = (1.0 - pp).max(0.0);
+                    let k = (1.0 - (pp - 0.2) / 0.8).clamp(0.0, 1.0);
                     (
-                        (base.0 as f32 * k).round() as u8,
-                        (base.1 as f32 * k).round() as u8,
-                        (base.2 as f32 * k).round() as u8,
+                        (flash_base.0 as f32 * k).round() as u8,
+                        (flash_base.1 as f32 * k).round() as u8,
+                        (flash_base.2 as f32 * k).round() as u8,
                     )
                 };
                 stamp(&mut grid, ci, ri, cx as i32, cy as i32, Ov { ch: '█', color: Some(c) });
@@ -363,7 +379,7 @@ pub fn run(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicBo
         std::thread::sleep(frame_delay);
     }
 
-    // Безусловное восстановление курсора — финальный clear делает main().
+    // Always restore the cursor — main() does the final clear.
     let _ = write!(out, "{ESC}[?25h");
     let _ = out.flush();
 }
@@ -374,7 +390,7 @@ mod tests {
 
     #[test]
     fn phase_boundaries() {
-        // Конвенция [lo, hi): граница принадлежит следующей фазе.
+        // [lo, hi) convention: the boundary belongs to the next phase.
         assert_eq!(phase_at(0.0), Phase::Static);
         assert_eq!(phase_at(0.17), Phase::Static);
         assert_eq!(phase_at(0.18), Phase::Collapse);
@@ -385,20 +401,20 @@ mod tests {
         assert_eq!(phase_at(0.779), Phase::Dot);
         assert_eq!(phase_at(0.78), Phase::Flash);
         assert_eq!(phase_at(0.999), Phase::Flash);
-        // Flash включает t == 1.0 (особый случай, не Static).
+        // Flash includes t == 1.0 (special case, not Static).
         assert_eq!(phase_at(1.0), Phase::Flash);
     }
 
     #[test]
     fn phase_clamps_out_of_range() {
-        // Выход за [0,1] не должен паниковать.
+        // Values outside [0,1] must not panic.
         assert_eq!(phase_at(-0.5), Phase::Static);
         assert_eq!(phase_at(1.5), Phase::Flash);
     }
 
     #[test]
     fn phase_monotonic() {
-        // Последовательность фаз не «прыгает назад» при росте t.
+        // The phase sequence never jumps backward as t grows.
         fn order(p: Phase) -> u8 {
             match p {
                 Phase::Static => 0,
@@ -426,7 +442,8 @@ mod tests {
 
     #[test]
     fn collapse_decreasing() {
-        // Монотонно не возрастает по p — края + общий тренд (формулу не фиксируем).
+        // Monotonically non-increasing in p — endpoints + overall trend (the
+        // exact formula is not pinned down).
         let mut prev = collapse_height(0.0, 24);
         for i in 1..=100 {
             let p = i as f32 / 100.0;
@@ -439,7 +456,7 @@ mod tests {
 
     #[test]
     fn collapse_band_centered() {
-        // На экране 24 строки, центр cy=12, h=4 → top=10, диапазон [10,14).
+        // On a 24-row screen, center cy=12, h=4 → top=10, range [10,14).
         let (top, bot) = collapse_band(12, 4);
         assert_eq!(bot - top, 4, "height must equal h");
         assert!(top <= 12 && 12 < bot, "range must contain cy");
@@ -448,7 +465,7 @@ mod tests {
 
     #[test]
     fn collapse_band_saturates_near_top() {
-        // cy меньше h/2 → top насыщается до 0, высота при этом сохраняется.
+        // cy smaller than h/2 → top saturates at 0; the height is preserved.
         let (top, bot) = collapse_band(1, 4);
         assert_eq!(top, 0);
         assert_eq!(bot - top, 4);
@@ -474,7 +491,7 @@ mod tests {
 
     #[test]
     fn easing_holds_then_snaps() {
-        // При p=0.5 высота ещё ~0.71·full; при p=0.9 — ~0.32·full (§3.6).
+        // At p=0.5 the height is still ~0.71·full; at p=0.9 ~0.32·full (§3.6).
         let h50 = collapse_height(0.5, 100) as f32 / 100.0;
         let h90 = collapse_height(0.9, 100) as f32 / 100.0;
         assert!(h50 > 0.65 && h50 < 0.78, "expected ~0.71 at p=0.5, got {h50}");
@@ -483,21 +500,21 @@ mod tests {
 
     #[test]
     fn glyph_table_valid() {
-        // Все индексы [0, LEN) отображаются в допустимое множество глифов.
+        // Every index in [0, LEN) maps into the allowed glyph set.
         let allowed = [' ', '░', '▒', '▓', '█'];
         for i in 0..GLYPH_TABLE_LEN {
             let ch = glyph_at(i);
             assert!(allowed.contains(&ch), "unexpected glyph {ch:?} at index {i}");
         }
-        // Каждый глиф из допустимого множества присутствует в таблице.
+        // Every glyph from the allowed set is present in the table.
         for &ch in &allowed {
             assert!(
                 (0..GLYPH_TABLE_LEN).any(|i| glyph_at(i) == ch),
                 "glyph {ch:?} missing from table"
             );
         }
-        // Минимальный вес ≥ 2 (спека §3.5 ставит минимальный вес 2) → каждый
-        // глиф встречается хотя бы дважды.
+        // Minimum weight ≥ 2 (spec §3.5 sets the minimum weight to 2) → every
+        // glyph appears at least twice.
         for &ch in &allowed {
             let count = (0..GLYPH_TABLE_LEN).filter(|&i| glyph_at(i) == ch).count();
             assert!(count >= 2, "glyph {ch:?} has weight {count}, expected ≥ 2");
@@ -506,13 +523,13 @@ mod tests {
 
     #[test]
     fn glyph_table_len_is_twelve() {
-        // Сумма весов: 2+3+3+2+2 = 12 (§3.5).
+        // Sum of weights: 2+3+3+2+2 = 12 (spec §3.5).
         assert_eq!(GLYPH_TABLE_LEN, 12);
     }
 
     #[test]
     fn glyph_at_wraps_safely() {
-        // Выход за границы таблицы безопасен — зацикливается по модулю.
+        // Out-of-range indices are safe — they wrap modulo the length.
         let allowed = [' ', '░', '▒', '▓', '█'];
         for i in [GLYPH_TABLE_LEN, GLYPH_TABLE_LEN + 1, 1_000_000] {
             assert!(allowed.contains(&glyph_at(i)));
@@ -521,13 +538,13 @@ mod tests {
 
     #[test]
     fn brightest_is_max_luminance() {
-        // Палитра, где ступень 5 ярче остальных по luminance.
+        // A palette where step 5 is brighter than the rest by luminance.
         let mut pal = [(0u8, 0u8, 0u8); 37];
         pal[5] = (200, 250, 100);
-        pal[36] = (255, 0, 0); // красный — канально ярче, но luminance меньше
+        pal[36] = (255, 0, 0); // red — brighter channel-wise, but lower luminance
         let b = brightest(&pal);
         assert_eq!(b, (200, 250, 100));
-        // Явная проверка: luminance brightest'а ≥ любой другой ступени.
+        // Explicit check: the brightest's luminance is ≥ every other step.
         let lb = luminance(b);
         for &c in pal.iter() {
             assert!(lb + 0.001 >= luminance(c), "{c:?} brighter than {b:?}");
@@ -536,12 +553,12 @@ mod tests {
 
     #[test]
     fn brightest_picks_low_index_when_inverted() {
-        // Симуляция --from "#00f0ff" --to "#002080" (§10): палитра от яркой
-        // бирюзы к тёмному синему — brightest должен быть на индексе 0.
+        // Simulating --from "#00f0ff" --to "#002080" (spec §10): the palette
+        // runs from bright cyan to dark blue — brightest must be at index 0.
         let mut pal = [(0u8, 0u8, 0u8); 37];
-        pal[0] = (0, 240, 255); // бирюза
-        pal[36] = (0, 32, 128); // тёмно-синий
-        // Промежуточные ступени линейно интерполированы — все тусклее pal[0].
+        pal[0] = (0, 240, 255); // cyan
+        pal[36] = (0, 32, 128); // dark blue
+        // Intermediate steps are linearly interpolated — all dimmer than pal[0].
         for (i, slot) in pal.iter_mut().enumerate().skip(1).take(35) {
             let t = i as f32 / 36.0;
             *slot = (
@@ -556,10 +573,10 @@ mod tests {
 
     #[test]
     fn brightest_matches_index36_for_default_fire_like() {
-        // Для дефолтной огневой палитры (тёмный→яркий) brightest совпадает с palette[36].
+        // For the default fire palette (dark→bright) brightest coincides with palette[36].
         let mut pal = [(0u8, 0u8, 0u8); 37];
         for (i, slot) in pal.iter_mut().enumerate() {
-            let v = (i as u8) * 7; // растёт с индексом
+            let v = (i as u8) * 7; // grows with the index
             *slot = (v, v / 2, 0);
         }
         let b = brightest(&pal);
