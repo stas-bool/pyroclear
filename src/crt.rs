@@ -110,14 +110,15 @@ pub fn collapse_band(cy: usize, h: usize) -> (usize, usize) {
     (top, top + h)
 }
 
-/// Weighted noise glyph table (spec §3.5): ' '×2, '░'×3, '▒'×3, '▓'×2, '█'×2.
-/// Length = sum of weights = 12. Order does not matter for the visual effect
-/// but is fixed for testability.
+/// Weighted noise glyph table (spec §3.5): ' '×4, '▀'×3, '▄'×3, '█'×2.
+/// Half-block glyphs '▀'/'▄' are used instead of density blocks '░▒▓' so each
+/// snow "pixel" is half a cell tall — finer-grained TV-snow. The hole weight
+/// (' ') is raised to 4 for an airier, sparser snowfield. '█' is a rare
+/// full-cell bright sparkle; ' ' leaves a noise hole. Length = 12.
 const GLYPH_TABLE: &[char] = &[
-    ' ', ' ',
-    '░', '░', '░',
-    '▒', '▒', '▒',
-    '▓', '▓',
+    ' ', ' ', ' ', ' ',
+    '▀', '▀', '▀',
+    '▄', '▄', '▄',
     '█', '█',
 ];
 const GLYPH_TABLE_LEN: usize = GLYPH_TABLE.len();
@@ -156,7 +157,7 @@ pub fn brightest(palette: &Palette) -> (u8, u8, u8) {
 
 /// One noise glyph: symbol + color (spec §3.5). The caller never stamps
 /// spaces (they leave the erase layer visible as a noise hole), so only the
-/// actually-drawn glyphs need a meaningful color: '█' → pure white, '░▒▓' →
+/// actually-drawn glyphs need a meaningful color: '█' → pure white, '▀▄' →
 /// equal-channel gray in 170..=240. The choice itself is random and not under
 /// test, but it leans on the deterministic glyph_at (spec §4).
 fn static_glyph(rng: &mut Rng) -> (char, (u8, u8, u8)) {
@@ -501,7 +502,7 @@ mod tests {
     #[test]
     fn glyph_table_valid() {
         // Every index in [0, LEN) maps into the allowed glyph set.
-        let allowed = [' ', '░', '▒', '▓', '█'];
+        let allowed = [' ', '▀', '▄', '█'];
         for i in 0..GLYPH_TABLE_LEN {
             let ch = glyph_at(i);
             assert!(allowed.contains(&ch), "unexpected glyph {ch:?} at index {i}");
@@ -523,14 +524,14 @@ mod tests {
 
     #[test]
     fn glyph_table_len_is_twelve() {
-        // Sum of weights: 2+3+3+2+2 = 12 (spec §3.5).
+        // Sum of weights: 4+3+3+2 = 12 (spec §3.5).
         assert_eq!(GLYPH_TABLE_LEN, 12);
     }
 
     #[test]
     fn glyph_at_wraps_safely() {
         // Out-of-range indices are safe — they wrap modulo the length.
-        let allowed = [' ', '░', '▒', '▓', '█'];
+        let allowed = [' ', '▀', '▄', '█'];
         for i in [GLYPH_TABLE_LEN, GLYPH_TABLE_LEN + 1, 1_000_000] {
             assert!(allowed.contains(&glyph_at(i)));
         }
