@@ -342,6 +342,19 @@ pub fn random_palette_choice() -> PaletteChoice {
     PaletteChoice::Named(id.to_string())
 }
 
+/// A uniformly random effect (fire / ufo / crt). Used by `--effect random`,
+/// mirroring `random_palette_choice` for palettes.
+pub fn random_effect() -> Effect {
+    use crate::engine::Rng;
+    let mut rng = Rng::new();
+    // Rng::range is inclusive → range(0, 2) yields 0, 1 or 2.
+    match rng.range(0, 2) {
+        0 => Effect::Fire,
+        1 => Effect::Ufo,
+        _ => Effect::Crt,
+    }
+}
+
 // ── Build final palette ───────────────────────────────────────────────
 
 pub fn build_palette(choice: &PaletteChoice) -> Palette {
@@ -423,16 +436,26 @@ fn parse_args() -> (Option<PaletteChoice>, bool, bool, Option<Effect>) {
             "--effect" | "-e" => {
                 i += 1;
                 match args.get(i) {
-                    Some(name) => match Effect::from_id(name) {
-                        Some(e) => effect = Some(e),
-                        None => {
-                            eprintln!(
-                                "{ESC}[1;38;2;255;70;70m✗ error:{ESC}[0m Unknown effect '{name}'\n\
-                                 {ESC}[38;2;95;95;115m  tip: effects are 'fire', 'ufo' and 'crt'{ESC}[0m"
-                            );
-                            std::process::exit(1);
+                    Some(name) => {
+                        // 'random' is a pick directive, not an effect: resolve it
+                        // immediately to a concrete effect via the PRNG, exactly like
+                        // --random does for palettes. The resolved effect is then saved
+                        // (unless --no-save), so it sticks for the next run.
+                        if name == "random" {
+                            effect = Some(random_effect());
+                        } else {
+                            match Effect::from_id(name) {
+                                Some(e) => effect = Some(e),
+                                None => {
+                                    eprintln!(
+                                        "{ESC}[1;38;2;255;70;70m✗ error:{ESC}[0m Unknown effect '{name}'\n\
+                                         {ESC}[38;2;95;95;115m  tip: effects are 'fire', 'ufo', 'crt' or 'random'{ESC}[0m"
+                                    );
+                                    std::process::exit(1);
+                                }
+                            }
                         }
-                    },
+                    }
                     None => {
                         eprintln!(
                             "{ESC}[1;38;2;255;70;70m✗ error:{ESC}[0m --effect needs a name\n\
