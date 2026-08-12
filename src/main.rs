@@ -28,6 +28,7 @@ use std::time::Duration;
 pub const ESC: &str = "\x1b";
 
 pub mod config;
+pub mod crt;
 pub mod display;
 pub mod engine;
 pub mod palettes;
@@ -92,6 +93,7 @@ fn main() {
     match settings.effect {
         config::Effect::Fire => burn(&palette, &settings, interrupted),
         config::Effect::Ufo => ufo::run(&settings, interrupted),
+        config::Effect::Crt => crt::run(&palette, &settings, interrupted),
     }
 
     // Final clear — always runs, even after SIGINT (cursor was restored in burn)
