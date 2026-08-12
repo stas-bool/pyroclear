@@ -14,6 +14,7 @@ use std::path::PathBuf;
 pub enum Effect {
     Fire,
     Ufo,
+    Crt,
 }
 
 impl Default for Effect {
@@ -27,6 +28,7 @@ impl Effect {
         match id {
             "fire" => Some(Effect::Fire),
             "ufo" => Some(Effect::Ufo),
+            "crt" => Some(Effect::Crt),
             _ => None,
         }
     }
@@ -35,6 +37,7 @@ impl Effect {
         match self {
             Effect::Fire => "fire",
             Effect::Ufo => "ufo",
+            Effect::Crt => "crt",
         }
     }
 }
@@ -425,7 +428,7 @@ fn parse_args() -> (Option<PaletteChoice>, bool, bool, Option<Effect>) {
                         None => {
                             eprintln!(
                                 "{ESC}[1;38;2;255;70;70m✗ error:{ESC}[0m Unknown effect '{name}'\n\
-                                 {ESC}[38;2;95;95;115m  tip: effects are 'fire' and 'ufo'{ESC}[0m"
+                                 {ESC}[38;2;95;95;115m  tip: effects are 'fire', 'ufo' and 'crt'{ESC}[0m"
                             );
                             std::process::exit(1);
                         }
