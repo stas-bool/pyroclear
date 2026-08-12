@@ -53,6 +53,41 @@ pub fn phase_at(t01: f32) -> Phase {
     }
 }
 
+/// Easing-фактор для схлопывания: (1-p)^0.5. Удержание полного размера
+/// большую часть фазы → стремительное смыкание к концу (§3.6). При p == 1.0
+/// даёт 0, что потом clamp'ится до 1 в вызове.
+fn ease_hold_then_snap(p: f32) -> f32 {
+    (1.0_f32 - p.clamp(0.0, 1.0)).max(0.0).sqrt()
+}
+
+/// Применить easing к полному размеру → текущий размер, не менее 1.
+fn ease_size(p: f32, full: usize) -> usize {
+    let raw = (full as f32 * ease_hold_then_snap(p)).round() as usize;
+    raw.max(1)
+}
+
+/// Активная высота вертикальной полосы на фазе Collapse (§4). Монотонно не
+/// возрастает по p; на p == 0 → full, на p == 1 → 1.
+pub fn collapse_height(p: f32, full: usize) -> usize {
+    ease_size(p, full)
+}
+
+/// Длина горизонтальной линии на фазе Dot (§4). Семантически идентична
+/// collapse_height — вынесено в отдельное имя для читаемости точки вызова.
+pub fn line_width(p: f32, full: usize) -> usize {
+    ease_size(p, full)
+}
+
+/// Строки активной вертикальной полосы высотой `h` вокруг центра `cy`.
+/// Возвращает полуоткрытый диапазон [top, top+h), центрированный по cy
+/// (целочисленное деление: top = cy - h/2, насыщаясь до 0). Решает
+/// неоднозначность чётного h единообразно — нижняя граница сдвигается вверх.
+/// Clamp сверху (до rows) делает вызывающий код в run().
+pub fn collapse_band(cy: usize, h: usize) -> (usize, usize) {
+    let top = cy.saturating_sub(h / 2);
+    (top, top + h)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +136,68 @@ mod tests {
             assert!(o >= prev, "phase regression at t={t}: {o} < {prev}");
             prev = o;
         }
+    }
+
+    #[test]
+    fn collapse_full_then_one() {
+        assert_eq!(collapse_height(0.0, 24), 24);
+        assert_eq!(collapse_height(1.0, 24), 1);
+    }
+
+    #[test]
+    fn collapse_decreasing() {
+        // Монотонно не возрастает по p — края + общий тренд (формулу не фиксируем).
+        let mut prev = collapse_height(0.0, 24);
+        for i in 1..=100 {
+            let p = i as f32 / 100.0;
+            let h = collapse_height(p, 24);
+            assert!(h <= prev, "collapse_height increased at p={p}: {h} > {prev}");
+            prev = h;
+        }
+        assert_eq!(prev, 1);
+    }
+
+    #[test]
+    fn collapse_band_centered() {
+        // На экране 24 строки, центр cy=12, h=4 → top=10, диапазон [10,14).
+        let (top, bot) = collapse_band(12, 4);
+        assert_eq!(bot - top, 4, "height must equal h");
+        assert!(top <= 12 && 12 < bot, "range must contain cy");
+        assert_eq!(top, 10);
+    }
+
+    #[test]
+    fn collapse_band_saturates_near_top() {
+        // cy меньше h/2 → top насыщается до 0, высота при этом сохраняется.
+        let (top, bot) = collapse_band(1, 4);
+        assert_eq!(top, 0);
+        assert_eq!(bot - top, 4);
+    }
+
+    #[test]
+    fn line_full_then_one() {
+        assert_eq!(line_width(0.0, 80), 80);
+        assert_eq!(line_width(1.0, 80), 1);
+    }
+
+    #[test]
+    fn line_decreasing() {
+        let mut prev = line_width(0.0, 80);
+        for i in 1..=100 {
+            let p = i as f32 / 100.0;
+            let w = line_width(p, 80);
+            assert!(w <= prev, "line_width increased at p={p}: {w} > {prev}");
+            prev = w;
+        }
+        assert_eq!(prev, 1);
+    }
+
+    #[test]
+    fn easing_holds_then_snaps() {
+        // При p=0.5 высота ещё ~0.71·full; при p=0.9 — ~0.32·full (§3.6).
+        let h50 = collapse_height(0.5, 100) as f32 / 100.0;
+        let h90 = collapse_height(0.9, 100) as f32 / 100.0;
+        assert!(h50 > 0.65 && h50 < 0.78, "expected ~0.71 at p=0.5, got {h50}");
+        assert!(h90 > 0.25 && h90 < 0.40, "expected ~0.32 at p=0.9, got {h90}");
     }
 }
