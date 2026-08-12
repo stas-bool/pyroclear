@@ -108,6 +108,30 @@ pub fn glyph_at(idx: usize) -> char {
     GLYPH_TABLE[idx % GLYPH_TABLE_LEN]
 }
 
+/// Perceived luminance по ITU-R BT.601: 0.299·R + 0.587·G + 0.114·B.
+/// Чистая функция — используется только в brightest().
+fn luminance(c: (u8, u8, u8)) -> f32 {
+    0.299 * c.0 as f32 + 0.587 * c.1 as f32 + 0.114 * c.2 as f32
+}
+
+/// Самая яркая ступень палитры по perceived luminance (§3.3/§4). Это цвет
+/// финальной вспышки (Flash). Универсальна для любого --from/--to: для дефолтной
+/// огневой палитры (тёмный→яркий) совпадает с palette[36]; для инвертированной
+/// --from "#00f0ff" --to "#002080" — с бирюзовым концом (индекс 0). NOT хардкод
+/// palette[36].
+pub fn brightest(palette: &Palette) -> (u8, u8, u8) {
+    let mut best = palette[0];
+    let mut best_lum = luminance(palette[0]);
+    for &c in palette.iter().skip(1) {
+        let l = luminance(c);
+        if l > best_lum {
+            best = c;
+            best_lum = l;
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +281,52 @@ mod tests {
         for i in [GLYPH_TABLE_LEN, GLYPH_TABLE_LEN + 1, 1_000_000] {
             assert!(allowed.contains(&glyph_at(i)));
         }
+    }
+
+    #[test]
+    fn brightest_is_max_luminance() {
+        // Палитра, где ступень 5 ярче остальных по luminance.
+        let mut pal = [(0u8, 0u8, 0u8); 37];
+        pal[5] = (200, 250, 100);
+        pal[36] = (255, 0, 0); // красный — канально ярче, но luminance меньше
+        let b = brightest(&pal);
+        assert_eq!(b, (200, 250, 100));
+        // Явная проверка: luminance brightest'а ≥ любой другой ступени.
+        let lb = luminance(b);
+        for &c in pal.iter() {
+            assert!(lb + 0.001 >= luminance(c), "{c:?} brighter than {b:?}");
+        }
+    }
+
+    #[test]
+    fn brightest_picks_low_index_when_inverted() {
+        // Симуляция --from "#00f0ff" --to "#002080" (§10): палитра от яркой
+        // бирюзы к тёмному синему — brightest должен быть на индексе 0.
+        let mut pal = [(0u8, 0u8, 0u8); 37];
+        pal[0] = (0, 240, 255); // бирюза
+        pal[36] = (0, 32, 128); // тёмно-синий
+        // Промежуточные ступени линейно интерполированы — все тусклее pal[0].
+        for i in 1..36 {
+            let t = i as f32 / 36.0;
+            pal[i] = (
+                ((1.0 - t) * 0.0 + t * 0.0) as u8,
+                ((1.0 - t) * 240.0 + t * 32.0) as u8,
+                ((1.0 - t) * 255.0 + t * 128.0) as u8,
+            );
+        }
+        let b = brightest(&pal);
+        assert_eq!(b, pal[0], "brightest must be the cyan end, not palette[36]");
+    }
+
+    #[test]
+    fn brightest_matches_index36_for_default_fire_like() {
+        // Для дефолтной огневой палитры (тёмный→яркий) brightest совпадает с palette[36].
+        let mut pal = [(0u8, 0u8, 0u8); 37];
+        for i in 0..37 {
+            let v = (i as u8) * 7; // растёт с индексом
+            pal[i] = (v, v / 2, 0);
+        }
+        let b = brightest(&pal);
+        assert_eq!(b, pal[36]);
     }
 }
