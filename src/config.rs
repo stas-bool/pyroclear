@@ -9,6 +9,36 @@ use std::path::PathBuf;
 
 // ── Data types ────────────────────────────────────────────────────────
 
+/// Which clear animation to run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Effect {
+    Fire,
+    Ufo,
+}
+
+impl Default for Effect {
+    fn default() -> Self {
+        Effect::Fire
+    }
+}
+
+impl Effect {
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "fire" => Some(Effect::Fire),
+            "ufo" => Some(Effect::Ufo),
+            _ => None,
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Effect::Fire => "fire",
+            Effect::Ufo => "ufo",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AnimSettings {
     pub fps: u32,
@@ -17,6 +47,7 @@ pub struct AnimSettings {
     pub direction: bool, // false = bottom-up (default), true = top-down
     pub duration: f32,   // 1 = 1 seconds, 1.2 = 1.2 seconds .. 5 = 5 seconds
     pub flames_duration: f32,   // 0 = stops instantly, 1 = stops at the end of the animation
+    pub effect: Effect,
 }
 
 impl Default for AnimSettings {
@@ -28,6 +59,7 @@ impl Default for AnimSettings {
             direction: false,
             duration: 2.2,
             flames_duration: 0.38,
+            effect: Effect::Fire,
         }
     }
 }
@@ -134,6 +166,11 @@ pub fn load_config() -> (Option<PaletteChoice>, AnimSettings) {
                         settings.flames_duration = f;
                     }
                 }
+                "effect" => {
+                    if let Some(e) = Effect::from_id(&val) {
+                        settings.effect = e;
+                    }
+                }
          
                 _ => {}
             }
@@ -177,6 +214,7 @@ pub fn save_config(choice: &PaletteChoice, settings: &AnimSettings) {
     content.push_str(&format!("direction        = {}\n", settings.direction));
     content.push_str(&format!("duration         = {}\n", settings.duration));
     content.push_str(&format!("flames_duration  = {}\n", settings.flames_duration));
+    content.push_str(&format!("effect           = {}\n", settings.effect.id()));
     let _ = std::fs::write(path, content);
 }
 
@@ -335,7 +373,7 @@ pub fn build_palette(choice: &PaletteChoice) -> Palette {
 // ── CLI argument parsing ──────────────────────────────────────────────
 
 /// Parse CLI flags. Returns (parsed palette choice, run_settings flag, is_reset flag).
-fn parse_args() -> (Option<PaletteChoice>, bool, bool) {
+fn parse_args() -> (Option<PaletteChoice>, bool, bool, Option<Effect>) {
     use crate::display::*;
 
     let args: Vec<String> = std::env::args().collect();
@@ -344,6 +382,7 @@ fn parse_args() -> (Option<PaletteChoice>, bool, bool) {
     let mut to = None;
     let mut run_settings = false;
     let mut is_reset = false;
+    let mut effect: Option<Effect> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -365,7 +404,7 @@ fn parse_args() -> (Option<PaletteChoice>, bool, bool) {
                 std::process::exit(0);
             }
             "--pick" | "-p" => match interactive_pick() {
-                Some(c) => return (Some(c), false, false),
+                Some(c) => return (Some(c), false, false, effect),
                 None => std::process::exit(0),
             },
             "--settings" | "-s" => {
@@ -373,13 +412,35 @@ fn parse_args() -> (Option<PaletteChoice>, bool, bool) {
             }
             "--random" | "-r" => {
                 let c = random_palette_choice();
-                return (Some(c), false, false);
+                return (Some(c), false, false, effect);
             }
             "--reset" => {
                 is_reset = true;
             }
+            "--effect" | "-e" => {
+                i += 1;
+                match args.get(i) {
+                    Some(name) => match Effect::from_id(name) {
+                        Some(e) => effect = Some(e),
+                        None => {
+                            eprintln!(
+                                "{ESC}[1;38;2;255;70;70m✗ error:{ESC}[0m Unknown effect '{name}'\n\
+                                 {ESC}[38;2;95;95;115m  tip: effects are 'fire' and 'ufo'{ESC}[0m"
+                            );
+                            std::process::exit(1);
+                        }
+                    },
+                    None => {
+                        eprintln!(
+                            "{ESC}[1;38;2;255;70;70m✗ error:{ESC}[0m --effect needs a name\n\
+                             {ESC}[38;2;95;95;115m  tip: pyroclear --effect ufo{ESC}[0m"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
             "--custom" => match interactive_custom() {
-                Some(c) => return (Some(c), false, false),
+                Some(c) => return (Some(c), false, false, effect),
                 None => std::process::exit(0),
             },
             "--start" => {
@@ -419,7 +480,7 @@ fn parse_args() -> (Option<PaletteChoice>, bool, bool) {
             );
             std::process::exit(1);
         };
-        return (Some(PaletteChoice::Custom { from: fc, to: tc }), false, false);
+        return (Some(PaletteChoice::Custom { from: fc, to: tc }), false, false, effect);
     }
 
     if let Some(name) = color {
@@ -430,16 +491,16 @@ fn parse_args() -> (Option<PaletteChoice>, bool, bool) {
             );
             std::process::exit(1);
         }
-        return (Some(PaletteChoice::Named(name)), false, false);
+        return (Some(PaletteChoice::Named(name)), false, false, effect);
     }
 
-    (None, run_settings, is_reset)
+    (None, run_settings, is_reset, effect)
 }
 
 /// Resolve the final (palette choice, animation settings) pair for this run.
 pub fn resolve_choice() -> (PaletteChoice, AnimSettings) {
     let (saved_choice, saved_settings) = load_config();
-    let (parsed_choice, run_settings, is_reset) = parse_args();
+    let (parsed_choice, run_settings, is_reset, parsed_effect) = parse_args();
 
     if is_reset {
         let c = PaletteChoice::Named("fire".to_string());
@@ -455,6 +516,17 @@ pub fn resolve_choice() -> (PaletteChoice, AnimSettings) {
     }
 
     let mut settings = saved_settings;
+
+    if let Some(e) = parsed_effect {
+        settings.effect = e;
+        if !has_no_save() {
+            let active = parsed_choice
+                .clone()
+                .or_else(|| saved_choice.clone())
+                .unwrap_or(PaletteChoice::Named("fire".to_string()));
+            save_config(&active, &settings);
+        }
+    }
 
     if run_settings {
         if let Some(new_settings) = interactive_settings(&settings) {

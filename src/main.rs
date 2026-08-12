@@ -32,6 +32,7 @@ pub mod display;
 pub mod engine;
 pub mod palettes;
 pub mod tui;
+pub mod ufo;
 #[cfg(windows)]
 pub mod win;
 
@@ -88,7 +89,10 @@ fn main() {
 
     let interrupted = install_sigint();
 
-    burn(&palette, &settings, interrupted);
+    match settings.effect {
+        config::Effect::Fire => burn(&palette, &settings, interrupted),
+        config::Effect::Ufo => ufo::run(&settings, interrupted),
+    }
 
     // Final clear — always runs, even after SIGINT (cursor was restored in burn)
     // Full clear: reset attrs, home, erase screen + scrollback

@@ -137,6 +137,7 @@ pub fn print_help() {
         ("--custom", "Interactive custom palette manager (TUI)"),
         ("--random, -r", "Random palette — different every run"),
         ("--reset", "Reset to default (fire), then burn"),
+        ("--effect <name>, -e", "Animation: 'fire' (default) or 'ufo'"),
     ];
     for (flag, desc) in modes {
         println!(
@@ -169,6 +170,7 @@ pub fn print_help() {
     sec("EXAMPLES");
     let ex: &[(&str, &str)] = &[
         ("pyroclear --start", "interactive guide & onboarding"),
+        ("pyroclear --effect ufo", "saucers disintegrate the screen"),
         ("pyroclear", "burn with saved / default palette"),
         ("pyroclear --color ocean", "burn ocean & save it"),
         (
