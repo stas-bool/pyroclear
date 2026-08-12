@@ -35,6 +35,26 @@ const PHASE_LINE_END: f32 = 0.58;
 const PHASE_DOT_END: f32 = 0.78;
 // PHASE_FLASH_END = 1.0 (неявно).
 
+// ── Overlay cell + grid-примитивы (как в ufo.rs) ──────────────────────
+
+#[derive(Clone, Copy)]
+struct Ov {
+    ch: char,
+    color: Option<(u8, u8, u8)>, // None ⇒ default fg/bg (используется для erase-пробела)
+}
+
+/// Поставить ячейку overlay в grid по координатам, с проверкой границ.
+fn stamp(grid: &mut [Option<Ov>], cols: i32, rows: i32, x: i32, y: i32, ov: Ov) {
+    if (0..cols).contains(&x) && (0..rows).contains(&y) {
+        grid[(y as usize) * (cols as usize) + (x as usize)] = Some(ov);
+    }
+}
+
+// Примечание: в отличие от ufo.rs, функции `burn()` здесь НЕТ. В CRT `burned`
+// всегда all-true (инвариант §3.2: весь экран принадлежит эффекту с первого
+// кадра Static), поэтому помечать отдельные ячейки не нужно — Layer-1 стирает
+// весь экран безусловно. Добавлять `burn()` не надо: она стала бы dead_code.
+
 /// Индекс/тип фазы по нормированному времени (0..=1).
 /// Конвенция границ: [lo, hi); phase_at(0.18) → Collapse, phase_at(0.50) → Line
 /// и т.д. При t == 1.0 → Flash.
@@ -130,6 +150,222 @@ pub fn brightest(palette: &Palette) -> (u8, u8, u8) {
         }
     }
     best
+}
+
+/// Один глиф шума: символ + цвет (§3.5). ' ' возвращает (0,0,0) — вызывающий
+/// код пропускает отрисовку пробела (дыры в шуме). Цвет: '█' → чистый белый;
+/// '░▒▓' → серый с равными каналами в диапазоне 170..=240; ' ' → любой
+/// (всё равно не рисуется). Сам выбор случаен и нетестируем, но опирается на
+/// детерминированную glyph_at (§4).
+fn static_glyph(rng: &mut Rng) -> (char, (u8, u8, u8)) {
+    // Инклюзивный Rng::range может вернуть GLYPH_TABLE_LEN; glyph_at берёт по
+    // модулю, поэтому безопасен (см. R3).
+    let idx = rng.range(0, GLYPH_TABLE_LEN as i32) as usize;
+    let ch = glyph_at(idx);
+    let color = match ch {
+        ' ' => (0, 0, 0),
+        '█' => (255, 255, 255),
+        _ => {
+            let v = rng.range(170, 240) as u8;
+            (v, v, v)
+        }
+    };
+    (ch, color)
+}
+
+/// Рендер overlay-grid в один String с последующим write_all (как в ufo.rs).
+/// None-ячейки пропускаются — на их месте остаётся оригинальный текст терминала
+/// (но в CRT весь экран после Static помечен burned, поэтому erase в run()
+/// сначала закроет их пробелом).
+fn render(buf: &mut String, grid: &[Option<Ov>], cols: usize, rows: usize) {
+    use std::fmt::Write as _;
+    buf.clear();
+    let mut last_color: Option<Option<(u8, u8, u8)>> = None;
+    let mut need_move = true;
+    let mut wcol = 0usize;
+    let mut wrow = 0usize;
+
+    for y in 0..rows {
+        for x in 0..cols {
+            let Some(ov) = grid[y * cols + x] else {
+                need_move = true;
+                continue;
+            };
+            if need_move || wrow != y || wcol != x {
+                let _ = write!(buf, "{ESC}[{};{}H", y + 1, x + 1);
+                last_color = None; // после move цвет нужно переизлучить
+                need_move = false;
+                wrow = y;
+                wcol = x;
+            }
+            if last_color != Some(ov.color) {
+                match ov.color {
+                    Some((r, g, b)) => {
+                        let _ = write!(buf, "{ESC}[38;2;{r};{g};{b}m{ESC}[49m");
+                    }
+                    None => {
+                        let _ = write!(buf, "{ESC}[39m{ESC}[49m");
+                    }
+                }
+                last_color = Some(ov.color);
+            }
+            buf.push(ov.ch);
+            wcol += 1;
+        }
+    }
+    let _ = write!(buf, "{ESC}[0m");
+}
+
+// ── Главный цикл ──────────────────────────────────────────────────────
+
+pub fn run(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicBool>) {
+    let (mut cols, mut rows) = terminal_size();
+    // Слишком мелко — main() всё равно сделает final clear.
+    if cols < 8 || rows < 4 {
+        return;
+    }
+    let fps = settings.fps.max(1) as u64;
+    let frame_delay = Duration::from_millis(1000 / fps);
+    // CRT clamp'ит длительность снизу до 0.5 c (новое для CRT, §7) — иначе фазы
+    // могут схлопнуться в <1 кадр. engine::burn и ufo::run этого не делают.
+    let t = Duration::from_secs_f32(settings.duration.max(0.5));
+
+    let mut rng = Rng::new();
+    // burned всегда all-true: с первого кадра (p=0 ⇒ фаза Static) весь экран
+    // принадлежит эффекту — помехи полностью заменяют сигнал (инвариант §3.2).
+    // Поэтому Layer-1 ниже стирает весь экран каждый кадр, а активная зона Layer-2
+    // перерисовывается поверх. Никогда не сбрасывать в vec![false] (в т.ч. ресайз).
+    let mut burned = vec![true; cols * rows];
+    let mut grid: Vec<Option<Ov>> = vec![None; cols * rows];
+    let mut buf = String::with_capacity(cols * rows * 6);
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let _ = write!(out, "{ESC}[?25l"); // спрятать курсор
+    let _ = out.flush();
+
+    let start = Instant::now();
+    loop {
+        if interrupted.load(Ordering::Relaxed) {
+            break;
+        }
+        let elapsed = start.elapsed();
+        if elapsed > t {
+            break;
+        }
+
+        // Live resize. burned всегда пересоздаётся как vec![true] (инвариант
+        // §3.2/§7) — иначе вне активной полосы всплывёт оригинальный текст.
+        let (nc, nr) = terminal_size();
+        if nc != cols || nr != rows {
+            cols = nc;
+            rows = nr;
+            if cols < 8 || rows < 4 {
+                break;
+            }
+            burned = vec![true; cols * rows];
+            grid = vec![None; cols * rows];
+            buf.reserve(cols * rows * 6);
+        }
+        let (ci, ri) = (cols as i32, rows as i32);
+
+        // Сброс overlay на этот кадр.
+        for cell in grid.iter_mut() {
+            *cell = None;
+        }
+
+        // Нормированное время кадра.
+        let p = (elapsed.as_secs_f32() / t.as_secs_f32()).clamp(0.0, 1.0);
+        let phase = phase_at(p);
+        let cy = rows / 2;
+        let cx = cols / 2;
+
+        // Layer 1: erase — закрыть пробелом весь экран (burned всегда all-true,
+        // инвариант §3.2). Активная зона Layer 2 перерисуется поверх; ' '-дыры
+        // шума в Static остаются erase-пробелом (текст под ними не просвечивает).
+        for y in 0..ri {
+            for x in 0..ci {
+                if burned[(y as usize) * cols + (x as usize)] {
+                    stamp(&mut grid, ci, ri, x, y, Ov { ch: ' ', color: None });
+                }
+            }
+        }
+
+        // Layer 2: активная зона текущей фазы (рисуется поверх erase).
+        match phase {
+            Phase::Static => {
+                // burned уже all-true — пометки не требуется. Рисуем плотный
+                // мерцающий шум; ' '-дыры не stamp'аются и остаются erase-пробелом.
+                for y in 0..ri {
+                    for x in 0..ci {
+                        let (ch, color) = static_glyph(&mut rng);
+                        if ch != ' ' {
+                            stamp(&mut grid, ci, ri, x, y, Ov { ch, color: Some(color) });
+                        }
+                    }
+                }
+            }
+            Phase::Collapse => {
+                // Локальный прогресс фазы: 0 на границе 0.18, 1 на границе 0.50.
+                let pp = ((p - PHASE_STATIC_END) / (PHASE_COLLAPSE_END - PHASE_STATIC_END))
+                    .clamp(0.0, 1.0);
+                let h = collapse_height(pp, rows);
+                let (top, bot) = collapse_band(cy, h);
+                let bot = bot.min(rows);
+                for y in top..bot {
+                    for x in 0..ci {
+                        let (ch, color) = static_glyph(&mut rng);
+                        if ch != ' ' {
+                            stamp(&mut grid, ci, ri, x, y as i32, Ov { ch, color: Some(color) });
+                        }
+                    }
+                }
+            }
+            Phase::Line => {
+                // Одна центральная строка — сплошная яркая белая линия.
+                for x in 0..ci {
+                    stamp(&mut grid, ci, ri, x, cy as i32, Ov { ch: '█', color: Some((255, 255, 255)) });
+                }
+            }
+            Phase::Dot => {
+                // Линия сжимается по горизонтали к центру.
+                let pp = ((p - PHASE_LINE_END) / (PHASE_DOT_END - PHASE_LINE_END))
+                    .clamp(0.0, 1.0);
+                let w = line_width(pp, cols);
+                let left = cx.saturating_sub(w / 2);
+                let right = (left + w).min(cols);
+                for x in left..right {
+                    stamp(&mut grid, ci, ri, x as i32, cy as i32, Ov { ch: '█', color: Some((255, 255, 255)) });
+                }
+            }
+            Phase::Flash => {
+                // Ячейка (cx,cy): короткая белая вспышка → brightest(palette) →
+                // линейное затухание яркости до нуля.
+                let pp = ((p - PHASE_DOT_END) / (1.0 - PHASE_DOT_END)).clamp(0.0, 1.0);
+                let c = if pp < 0.2 {
+                    (255, 255, 255)
+                } else {
+                    let base = brightest(palette);
+                    let k = (1.0 - pp).max(0.0);
+                    (
+                        (base.0 as f32 * k).round() as u8,
+                        (base.1 as f32 * k).round() as u8,
+                        (base.2 as f32 * k).round() as u8,
+                    )
+                };
+                stamp(&mut grid, ci, ri, cx as i32, cy as i32, Ov { ch: '█', color: Some(c) });
+            }
+        }
+
+        render(&mut buf, &grid, cols, rows);
+        let _ = out.write_all(buf.as_bytes());
+        let _ = out.flush();
+        std::thread::sleep(frame_delay);
+    }
+
+    // Безусловное восстановление курсора — финальный clear делает main().
+    let _ = write!(out, "{ESC}[?25h");
+    let _ = out.flush();
 }
 
 #[cfg(test)]
