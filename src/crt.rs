@@ -542,9 +542,9 @@ mod tests {
         pal[0] = (0, 240, 255); // бирюза
         pal[36] = (0, 32, 128); // тёмно-синий
         // Промежуточные ступени линейно интерполированы — все тусклее pal[0].
-        for i in 1..36 {
+        for (i, slot) in pal.iter_mut().enumerate().skip(1).take(35) {
             let t = i as f32 / 36.0;
-            pal[i] = (
+            *slot = (
                 ((1.0 - t) * 0.0 + t * 0.0) as u8,
                 ((1.0 - t) * 240.0 + t * 32.0) as u8,
                 ((1.0 - t) * 255.0 + t * 128.0) as u8,
@@ -558,9 +558,9 @@ mod tests {
     fn brightest_matches_index36_for_default_fire_like() {
         // Для дефолтной огневой палитры (тёмный→яркий) brightest совпадает с palette[36].
         let mut pal = [(0u8, 0u8, 0u8); 37];
-        for i in 0..37 {
+        for (i, slot) in pal.iter_mut().enumerate() {
             let v = (i as u8) * 7; // растёт с индексом
-            pal[i] = (v, v / 2, 0);
+            *slot = (v, v / 2, 0);
         }
         let b = brightest(&pal);
         assert_eq!(b, pal[36]);
