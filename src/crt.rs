@@ -88,6 +88,26 @@ pub fn collapse_band(cy: usize, h: usize) -> (usize, usize) {
     (top, top + h)
 }
 
+/// Взвешенная таблица глифов помех (§3.5): ' '×2, '░'×3, '▒'×3, '▓'×2, '█'×2.
+/// Длина = сумма весов = 12. Порядок не важен для визуального эффекта, но
+/// фиксируется для тестируемости.
+const GLYPH_TABLE: &[char] = &[
+    ' ', ' ',
+    '░', '░', '░',
+    '▒', '▒', '▒',
+    '▓', '▓',
+    '█', '█',
+];
+const GLYPH_TABLE_LEN: usize = GLYPH_TABLE.len();
+
+/// Символ шума по индексу во взвешенной таблице (§4). Безопасен для любого
+/// idx: берётся по модулю длины, чтобы инклюзивный Rng::range (см. R3) не
+/// мог выйти за границы. Для idx ∈ [0, GLYPH_TABLE_LEN) эквивалентно прямому
+/// индексу — это и проверяется в тесте.
+pub fn glyph_at(idx: usize) -> char {
+    GLYPH_TABLE[idx % GLYPH_TABLE_LEN]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +219,43 @@ mod tests {
         let h90 = collapse_height(0.9, 100) as f32 / 100.0;
         assert!(h50 > 0.65 && h50 < 0.78, "expected ~0.71 at p=0.5, got {h50}");
         assert!(h90 > 0.25 && h90 < 0.40, "expected ~0.32 at p=0.9, got {h90}");
+    }
+
+    #[test]
+    fn glyph_table_valid() {
+        // Все индексы [0, LEN) отображаются в допустимое множество глифов.
+        let allowed = [' ', '░', '▒', '▓', '█'];
+        for i in 0..GLYPH_TABLE_LEN {
+            let ch = glyph_at(i);
+            assert!(allowed.contains(&ch), "unexpected glyph {ch:?} at index {i}");
+        }
+        // Каждый глиф из допустимого множества присутствует в таблице.
+        for &ch in &allowed {
+            assert!(
+                (0..GLYPH_TABLE_LEN).any(|i| glyph_at(i) == ch),
+                "glyph {ch:?} missing from table"
+            );
+        }
+        // Минимальный вес ≥ 2 (спека §3.5 ставит минимальный вес 2) → каждый
+        // глиф встречается хотя бы дважды.
+        for &ch in &allowed {
+            let count = (0..GLYPH_TABLE_LEN).filter(|&i| glyph_at(i) == ch).count();
+            assert!(count >= 2, "glyph {ch:?} has weight {count}, expected ≥ 2");
+        }
+    }
+
+    #[test]
+    fn glyph_table_len_is_twelve() {
+        // Сумма весов: 2+3+3+2+2 = 12 (§3.5).
+        assert_eq!(GLYPH_TABLE_LEN, 12);
+    }
+
+    #[test]
+    fn glyph_at_wraps_safely() {
+        // Выход за границы таблицы безопасен — зацикливается по модулю.
+        let allowed = [' ', '░', '▒', '▓', '█'];
+        for i in [GLYPH_TABLE_LEN, GLYPH_TABLE_LEN + 1, 1_000_000] {
+            assert!(allowed.contains(&glyph_at(i)));
+        }
     }
 }
