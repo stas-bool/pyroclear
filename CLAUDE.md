@@ -67,7 +67,7 @@ Both `engine::render` and `ufo::render` build the whole frame into one `String`,
 
 - `FIRE_PALETTE` — the built-in 37-color ramp (the only hand-authored palette).
 - `NAMED_PALETTES: &[(&str id, display, desc, from_hex, to_hex)]` — the 300+ entries; each is a two-color gradient generated at runtime.
-- `CATEGORIES` — `(&str name, start, end)` index ranges into `NAMED_PALETTES`, used by `--list-colors` and the picker.
+- The picker is a searchable TUI over `NAMED_PALETTES` (upstream removed `CATEGORIES` and the `--list-colors` flag when the palette list grew past ~700 entries).
 - `generate_palette(from, to)` interpolates over 37 steps **through HSV** (hue-aware, `lerp_hue`), then `soften(&raw, SOFTEN_DESATURATE=0.62, SOFTEN_BRIGHTEN=0.32)` is applied to every palette produced by `config::build_palette` (including `--info` previews). When touching color output, apply the same `soften` call or previews won't match the burn.
 - `Palette` is 37 entries because heat is `0..=36`.
 
@@ -76,7 +76,7 @@ Both `engine::render` and `ufo::render` build the whole frame into one `String`,
 `resolve_choice()` is the precedence brain; trace it before changing flag behavior:
 
 1. `load_config()` reads `config.toml` → `(saved_choice, saved_settings)`.
-2. `parse_args()` reads CLI flags → `(parsed_choice, run_settings, is_reset, parsed_effect)`. Some flags (`--list-colors`, `--pick`, `--custom`, `--start`, `--info`, `--version`, `--help`) print/exit directly from inside the parser.
+2. `parse_args(&saved_settings)` reads CLI flags → `(parsed_choice, parsed_settings, run_settings, is_reset, parsed_effect)`; the TUI flags (`--pick`, `--custom`) may return overridden `AnimSettings` alongside the palette choice. Some flags (`--pick`, `--custom`, `--start`, `--info`, `--version`, `--help`) print/exit directly from inside the parser.
 3. Precedence: `--reset` wins; then `--effect`; then `--settings` (interactive); then an explicit palette choice (`--color`, `--from/--to`, `--random`, or a TUI result); else fall back to the saved/default palette.
 4. Every state-changing path persists via `save_config(...)` **unless** `--no-save` is present (`has_no_save()` re-scans `env::args`, since the flag is position-independent).
 

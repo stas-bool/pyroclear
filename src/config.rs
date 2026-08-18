@@ -78,12 +78,35 @@ pub enum PaletteChoice {
 
 // ── Custom palette storage path ──────────────────────────────────────
 
+/// Reads an env var, treating unset and empty as the same thing.
+fn env_path(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// The user's home directory.
+///
+/// On Windows `HOME` is normally unset (only MSYS/Git Bash sets it, and to a
+/// POSIX path like `/c/Users/x` that native Windows APIs can't open), so
+/// `USERPROFILE` is preferred there, with `HOMEDRIVE` + `HOMEPATH` as a
+/// fallback for the rare setups that only define those.
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(profile) = env_path("USERPROFILE") {
+            return Some(PathBuf::from(profile));
+        }
+        if let (Some(drive), Some(path)) = (env_path("HOMEDRIVE"), env_path("HOMEPATH")) {
+            return Some(PathBuf::from(format!("{drive}{path}")));
+        }
+    }
+    env_path("HOME").map(PathBuf::from)
+}
+
 pub fn config_dir() -> Option<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+    if let Some(xdg) = env_path("XDG_CONFIG_HOME") {
         return Some(PathBuf::from(xdg).join("pyroclear"));
     }
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".config/pyroclear"))
+    Some(home_dir()?.join(".config").join("pyroclear"))
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -388,8 +411,15 @@ pub fn build_palette(choice: &PaletteChoice) -> Palette {
 
 // ── CLI argument parsing ──────────────────────────────────────────────
 
-/// Parse CLI flags. Returns (parsed palette choice, run_settings flag, is_reset flag).
-fn parse_args() -> (Option<PaletteChoice>, bool, bool, Option<Effect>) {
+/// Parse CLI flags. Returns (parsed palette choice, optional overridden
+/// settings, run_settings flag, is_reset flag, parsed effect).
+fn parse_args(saved_settings: &AnimSettings) -> (
+    Option<PaletteChoice>,
+    Option<AnimSettings>,
+    bool,
+    bool,
+    Option<Effect>,
+) {
     use crate::display::*;
 
     let args: Vec<String> = std::env::args().collect();
@@ -415,12 +445,10 @@ fn parse_args() -> (Option<PaletteChoice>, bool, bool, Option<Effect>) {
                 i += 1;
                 to = args.get(i).cloned();
             }
-            "--list-colors" | "--list" => {
-                print_color_list();
-                std::process::exit(0);
-            }
-            "--pick" | "-p" => match interactive_pick() {
-                Some(c) => return (Some(c), false, false, effect),
+            "--pick" | "-p" => match interactive_pick(saved_settings.clone()) {
+                Some((c, new_settings)) => {
+                    return (Some(c), Some(new_settings), false, false, effect)
+                }
                 None => std::process::exit(0),
             },
             "--settings" | "-s" => {
@@ -428,7 +456,7 @@ fn parse_args() -> (Option<PaletteChoice>, bool, bool, Option<Effect>) {
             }
             "--random" | "-r" => {
                 let c = random_palette_choice();
-                return (Some(c), false, false, effect);
+                return (Some(c), None, false, false, effect);
             }
             "--reset" => {
                 is_reset = true;
@@ -465,8 +493,10 @@ fn parse_args() -> (Option<PaletteChoice>, bool, bool, Option<Effect>) {
                     }
                 }
             }
-            "--custom" => match interactive_custom() {
-                Some(c) => return (Some(c), false, false, effect),
+            "--custom" => match interactive_custom(saved_settings.clone()) {
+                Some((c, new_settings)) => {
+                    return (Some(c), Some(new_settings), false, false, effect)
+                }
                 None => std::process::exit(0),
             },
             "--start" => {
@@ -506,27 +536,28 @@ fn parse_args() -> (Option<PaletteChoice>, bool, bool, Option<Effect>) {
             );
             std::process::exit(1);
         };
-        return (Some(PaletteChoice::Custom { from: fc, to: tc }), false, false, effect);
+        return (Some(PaletteChoice::Custom { from: fc, to: tc }), None, false, false, effect);
     }
 
     if let Some(name) = color {
         if let Err(e) = validate_named(&name) {
             eprintln!(
                 "{ESC}[1;38;2;255;70;70m✗ error:{ESC}[0m {e}\n\
-                 {ESC}[38;2;95;95;115m  tip: run --list-colors or --pick to browse all palettes{ESC}[0m"
+                 {ESC}[38;2;95;95;115m  tip: run pyroclear --pick to browse all palettes{ESC}[0m"
             );
             std::process::exit(1);
         }
-        return (Some(PaletteChoice::Named(name)), false, false, effect);
+        return (Some(PaletteChoice::Named(name)), None, false, false, effect);
     }
 
-    (None, run_settings, is_reset, effect)
+    (None, None, run_settings, is_reset, effect)
 }
 
 /// Resolve the final (palette choice, animation settings) pair for this run.
 pub fn resolve_choice() -> (PaletteChoice, AnimSettings) {
     let (saved_choice, saved_settings) = load_config();
-    let (parsed_choice, run_settings, is_reset, parsed_effect) = parse_args();
+    let (parsed_choice, parsed_settings, run_settings, is_reset, parsed_effect) =
+        parse_args(&saved_settings);
 
     if is_reset {
         let c = PaletteChoice::Named("fire".to_string());
@@ -541,7 +572,8 @@ pub fn resolve_choice() -> (PaletteChoice, AnimSettings) {
         return (c, default_settings);
     }
 
-    let mut settings = saved_settings;
+    // Settings returned from the TUI (--pick, --custom) take priority over saved settings.
+    let mut settings = parsed_settings.unwrap_or(saved_settings);
 
     if let Some(e) = parsed_effect {
         settings.effect = e;
@@ -554,22 +586,18 @@ pub fn resolve_choice() -> (PaletteChoice, AnimSettings) {
         }
     }
 
+    let mut choice_opt = parsed_choice;
+
     if run_settings {
-        if let Some(new_settings) = interactive_settings(&settings) {
+        if let Some((new_choice, new_settings)) = interactive_settings(&settings) {
             settings = new_settings;
-            if !has_no_save() {
-                let active_choice = parsed_choice
-                    .clone()
-                    .or_else(|| saved_choice.clone())
-                    .unwrap_or(PaletteChoice::Named("fire".to_string()));
-                save_config(&active_choice, &settings);
-            }
+            choice_opt = Some(new_choice);
         } else {
             std::process::exit(0);
         }
     }
 
-    if let Some(choice) = parsed_choice {
+    if let Some(choice) = choice_opt {
         if !has_no_save() {
             save_config(&choice, &settings);
         }
