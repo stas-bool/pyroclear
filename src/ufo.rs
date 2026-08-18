@@ -244,7 +244,7 @@ fn squadron_rows(rows: i32) -> Vec<i32> {
 pub fn run(settings: &AnimSettings, interrupted: Arc<AtomicBool>) {
     let (mut cols, mut rows) = terminal_size();
     // Too small to bother — let main() clear the screen.
-    if cols < 8 || rows < (SAUCER_H as usize + 2) {
+    if cols < 8 || rows < (SAUCER_H + 2) {
         return;
     }
     let (cols_i, rows_i) = (cols as i32, rows as i32);
@@ -293,7 +293,7 @@ pub fn run(settings: &AnimSettings, interrupted: Arc<AtomicBool>) {
         if nc != cols || nr != rows {
             cols = nc;
             rows = nr;
-            if cols < 8 || rows < (SAUCER_H as usize + 2) {
+            if cols < 8 || rows < (SAUCER_H + 2) {
                 break;
             }
             burned = vec![false; cols * rows];
@@ -529,6 +529,6 @@ mod tests {
         for &(x, y) in &cells {
             assert!(x < 80 && y < 24);
         }
-        assert!(cells.contains(&(0, 0)) == false);
+        assert!(!cells.contains(&(0, 0)));
     }
 }

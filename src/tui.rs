@@ -82,7 +82,7 @@ pub fn read_key() -> Key {
     if n == 0 {
         return Key::Other;
     }
-    match &buf[..n as usize] {
+    match &buf[..n] {
         [0x1b, b'[', b'A', ..] => Key::Up,
         [0x1b, b'[', b'B', ..] => Key::Down,
         [0x1b, b'[', b'C', ..] => Key::Right,
@@ -330,14 +330,14 @@ impl PreviewFire {
                         current_bg_color = Some(rgb);
                         current_is_default = false;
                     }
-                    line.push_str(" ");
+                    line.push(' ');
                 } else {
                     if !current_is_default {
                         line.push_str(&format!("{ESC}[49m"));
                         current_is_default = true;
                         current_bg_color = None;
                     }
-                    line.push_str(" ");
+                    line.push(' ');
                 }
             }
             line.push_str(&format!("{ESC}[0m"));

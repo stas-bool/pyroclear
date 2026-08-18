@@ -11,17 +11,14 @@ use std::path::PathBuf;
 
 /// Which clear animation to run.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Default)]
 pub enum Effect {
+    #[default]
     Fire,
     Ufo,
     Crt,
 }
 
-impl Default for Effect {
-    fn default() -> Self {
-        Effect::Fire
-    }
-}
 
 impl Effect {
     pub fn from_id(id: &str) -> Option<Self> {
