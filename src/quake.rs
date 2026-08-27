@@ -12,6 +12,8 @@
 // nothing to conflict with (model purity invariant, spec §3.2).
 
 use crate::palettes::Palette;
+use crate::ESC;
+use std::fmt::Write as _;
 
 /// Earthquake phases (spec §2). Order matters — monotonic in t.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -173,6 +175,70 @@ pub fn particle_dies(y_new: i32, rows: i32, row_broken: &[bool]) -> bool {
         return true;
     }
     y_new >= 0 && !row_broken[y_new as usize]
+}
+
+// ── Overlay cell + grid primitives (as in ufo.rs) ──────────────────────
+
+#[derive(Clone, Copy)]
+struct Ov {
+    ch: char,
+    color: Option<(u8, u8, u8)>, // None ⇒ default fg/bg (the erase space)
+}
+
+/// Place an overlay cell into the grid at the given coordinates, bounds-checked.
+fn stamp(grid: &mut [Option<Ov>], cols: i32, rows: i32, x: i32, y: i32, ov: Ov) {
+    if (0..cols).contains(&x) && (0..rows).contains(&y) {
+        grid[(y as usize) * (cols as usize) + (x as usize)] = Some(ov);
+    }
+}
+
+/// Mark a cell as touched by the effect, bounds-checked (as burn() in ufo.rs).
+fn burn(burned: &mut [bool], cols: i32, rows: i32, x: i32, y: i32) {
+    if (0..cols).contains(&x) && (0..rows).contains(&y) {
+        burned[(y as usize) * (cols as usize) + (x as usize)] = true;
+    }
+}
+
+/// Render the overlay grid into a String (as in ufo.rs, BUT the buffer is NOT
+/// cleared here: a quake frame starts with the ICH/DCH shake prefix that
+/// run() writes into the same buf before calling render — one String, one
+/// write_all per frame, spec §3.2). None cells are skipped so the original
+/// terminal text shows through until the effect reaches it.
+fn render(buf: &mut String, grid: &[Option<Ov>], cols: usize, rows: usize) {
+    let mut last_color: Option<Option<(u8, u8, u8)>> = None;
+    let mut need_move = true;
+    let mut wcol = 0usize;
+    let mut wrow = 0usize;
+
+    for y in 0..rows {
+        for x in 0..cols {
+            let Some(ov) = grid[y * cols + x] else {
+                need_move = true;
+                continue;
+            };
+            if need_move || wrow != y || wcol != x {
+                let _ = write!(buf, "{ESC}[{};{}H", y + 1, x + 1);
+                last_color = None; // color must be re-emitted after a cursor move
+                need_move = false;
+                wrow = y;
+                wcol = x;
+            }
+            if last_color != Some(ov.color) {
+                match ov.color {
+                    Some((r, g, b)) => {
+                        let _ = write!(buf, "{ESC}[38;2;{r};{g};{b}m{ESC}[49m");
+                    }
+                    None => {
+                        let _ = write!(buf, "{ESC}[39m{ESC}[49m");
+                    }
+                }
+                last_color = Some(ov.color);
+            }
+            buf.push(ov.ch);
+            wcol += 1;
+        }
+    }
+    let _ = write!(buf, "{ESC}[0m");
 }
 
 #[cfg(test)]
