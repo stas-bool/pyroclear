@@ -17,6 +17,9 @@
 //   config    — AnimSettings, PaletteChoice, config I/O, CLI parsing
 //   display   — banner, help, info, start guide, color list
 //   engine    — PRNG, terminal size, fire simulation loop
+//   ufo       — UFO flyby effect (lasers, craters, shockwaves)
+//   crt       — CRT TV power-off effect
+//   quake     — earthquake effect (ICH/DCH shake, seismic wave, debris)
 //   tui       — raw terminal, key input, picker & settings TUIs
 //   win       — hand-rolled Win32 console bindings (Windows only)
 
