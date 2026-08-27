@@ -32,6 +32,7 @@ pub mod crt;
 pub mod display;
 pub mod engine;
 pub mod palettes;
+pub mod quake;
 pub mod tui;
 pub mod ufo;
 #[cfg(windows)]
