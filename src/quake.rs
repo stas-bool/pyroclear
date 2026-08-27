@@ -137,6 +137,44 @@ pub fn debris_color(palette: &Palette, idx: i32) -> (u8, u8, u8) {
     palette[idx.clamp(18, 36) as usize]
 }
 
+// ── Particles ──────────────────────────────────────────────────────────
+
+/// Tuning constants (spec §3.7) — starting values, tuned by eye.
+const G: f32 = 0.20; // gravity, cells/frame²
+const K_WIND: f32 = 0.02; // wind acceleration factor
+
+/// One debris crumb (spec §3.4). Position in cells; y grows downward.
+pub struct Particle {
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    ch: char,
+    color: (u8, u8, u8),
+    age: u32,
+}
+
+/// One frame of particle physics (spec §3.4): gravity, wind drift,
+/// integration — physics only; death is decided by particle_dies in run().
+pub fn step_particle(p: &mut Particle, wind: i32) {
+    p.vy += G;
+    p.vx += wind as f32 * K_WIND;
+    p.x += p.vx;
+    p.y += p.vy;
+}
+
+/// Particle death by its new row (spec §3.4, causes 1–2): flew past the
+/// bottom of the screen, or entered a still-intact row (a crumb dies on
+/// contact with surviving text). age > MAX_AGE is a trivial comparison
+/// checked inline in run(). A negative row (tossed above the top edge) keeps
+/// flying.
+pub fn particle_dies(y_new: i32, rows: i32, row_broken: &[bool]) -> bool {
+    if y_new >= rows {
+        return true;
+    }
+    y_new >= 0 && !row_broken[y_new as usize]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,5 +372,84 @@ mod tests {
         assert_eq!(debris_color(&pal, 36), pal[36]);
         assert_eq!(debris_color(&pal, 17), pal[18]);
         assert_eq!(debris_color(&pal, 37), pal[36]);
+    }
+
+    #[test]
+    fn particle_falls() {
+        let mut p = Particle {
+            x: 10.0,
+            y: 5.0,
+            vx: 0.0,
+            vy: 0.05,
+            ch: '·',
+            color: (1, 2, 3),
+            age: 0,
+        };
+        let vy0 = p.vy;
+        let y0 = p.y;
+        step_particle(&mut p, 0);
+        assert!(p.vy > vy0, "gravity must grow vy");
+        assert!(p.y > y0, "particle must fall");
+        // A second step keeps falling.
+        let y1 = p.y;
+        step_particle(&mut p, 0);
+        assert!(p.y > y1);
+    }
+
+    #[test]
+    fn particle_wind_drift() {
+        // wind = +2 → vx grows (pushed right every frame).
+        let mut p = Particle {
+            x: 0.0,
+            y: 0.0,
+            vx: 0.0,
+            vy: 0.0,
+            ch: ',',
+            color: (0, 0, 0),
+            age: 0,
+        };
+        step_particle(&mut p, 2);
+        assert!(p.vx > 0.0, "vx must grow under wind=+2");
+        // wind = 0 → vx does not change.
+        let mut q = Particle {
+            x: 0.0,
+            y: 0.0,
+            vx: 0.25,
+            vy: 0.0,
+            ch: ',',
+            color: (0, 0, 0),
+            age: 0,
+        };
+        step_particle(&mut q, 0);
+        assert_eq!(q.vx, 0.25, "vx must not change under wind=0");
+    }
+
+    #[test]
+    fn particle_dies_offscreen() {
+        let rb = [false, false, true];
+        // Flew past the bottom (rows = 3): y >= rows → true.
+        assert!(particle_dies(3, 3, &rb));
+        assert!(particle_dies(10, 3, &rb));
+        // Still on screen in a broken row → alive.
+        assert!(!particle_dies(2, 3, &rb));
+    }
+
+    #[test]
+    fn particle_dies_on_intact_row() {
+        let rb = [false, false, true];
+        // An intact row kills the crumb on contact with surviving text.
+        assert!(particle_dies(0, 3, &rb));
+        assert!(particle_dies(1, 3, &rb));
+        // A broken row does not.
+        assert!(!particle_dies(2, 3, &rb));
+    }
+
+    #[test]
+    fn particle_dies_negative_y_survives() {
+        // Tossed above the top edge: no row to hit — keeps flying (and must
+        // not panic on a negative index).
+        let rb = [false, false, false];
+        assert!(!particle_dies(-1, 3, &rb));
+        assert!(!particle_dies(-5, 3, &rb));
     }
 }
