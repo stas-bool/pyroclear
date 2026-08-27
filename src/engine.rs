@@ -174,9 +174,7 @@ fn resize_grid(cols: usize, rows: usize, direction: u8) -> Vec<u8> {
     match direction {
         1 => {
             // Top → Bottom: seed top row
-            for x in 0..cols {
-                grid[x] = MAX_HEAT;
-            }
+            grid[..cols].fill(MAX_HEAT);
         }
         2 => {
             // Left → Right: seed left column
@@ -247,7 +245,7 @@ pub fn burn(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicB
         if elapsed <= source_cool_at {
             match direction {
                 1 => {
-                    for x in 0..cols { grid[x] = MAX_HEAT; }
+                    grid[..cols].fill(MAX_HEAT);
                 }
                 2 => {
                     for y in 0..rows { grid[y * cols] = MAX_HEAT; }
@@ -290,9 +288,9 @@ pub fn burn(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicB
                         }
                     }
                     if elapsed > source_cool_at {
-                        for x in 0..cols {
+                        for cell in grid.iter_mut().take(cols) {
                             let dec = rng.range(2, 6);
-                            grid[x] = (grid[x] as i32 - dec).max(0) as u8; // top row
+                            *cell = (*cell as i32 - dec).max(0) as u8; // top row
                         }
                     }
                 }
