@@ -11,6 +11,8 @@
 // broken) rows: those have no burned cells and an empty overlay, so there is
 // nothing to conflict with (model purity invariant, spec §3.2).
 
+use crate::palettes::Palette;
+
 /// Earthquake phases (spec §2). Order matters — monotonic in t.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
@@ -102,6 +104,37 @@ pub fn epi_dist(x: i32, y: i32, ecx: i32, ecy: i32) -> f32 {
 /// (spec §3.3)? The boundary is inclusive: |dy| ≤ r.
 pub fn row_reached(dy: i32, r: f32) -> bool {
     (dy.abs() as f32) <= r
+}
+
+// ── Debris glyphs + colors ─────────────────────────────────────────────
+
+/// Weighted debris glyph table (spec §3.4): '·'×4, ','×2, '.'×2, '▘'×2,
+/// '▝'×2, '▖'×2, '▗'×2, '░'×2, '▒'×1. Sum of weights = 19.
+const DEBRIS_TABLE: &[char] = &[
+    '·', '·', '·', '·',
+    ',', ',',
+    '.', '.',
+    '▘', '▘',
+    '▝', '▝',
+    '▖', '▖',
+    '▗', '▗',
+    '░', '░',
+    '▒',
+];
+const DEBRIS_TABLE_LEN: usize = DEBRIS_TABLE.len();
+
+/// Debris glyph by index into the weighted table (spec §4). Safe for any idx:
+/// taken modulo the length, so the inclusive Rng::range can never go out of
+/// bounds (same safety as glyph_at in crt.rs; see risk R2).
+pub fn debris_glyph(idx: usize) -> char {
+    DEBRIS_TABLE[idx % DEBRIS_TABLE_LEN]
+}
+
+/// Debris color — a random step of the bright palette half (spec §3.5):
+/// idx is clamped into 18..=36. Direct index, no soften() — the palette is
+/// already softened in config::build_palette.
+pub fn debris_color(palette: &Palette, idx: i32) -> (u8, u8, u8) {
+    palette[idx.clamp(18, 36) as usize]
 }
 
 #[cfg(test)]
@@ -252,5 +285,54 @@ mod tests {
         // A zero-radius wave reaches only the epicenter row itself.
         assert!(row_reached(0, 0.0));
         assert!(!row_reached(1, 0.0));
+    }
+
+    #[test]
+    fn debris_table_len_is_nineteen() {
+        // Sum of weights: 4+2+2+2+2+2+2+2+1 = 19 (§3.4).
+        assert_eq!(DEBRIS_TABLE_LEN, 19);
+    }
+
+    #[test]
+    fn debris_glyph_valid() {
+        let allowed = ['·', ',', '.', '▘', '▝', '▖', '▗', '░', '▒'];
+        // Every index in [0, LEN) maps into the allowed set.
+        for i in 0..DEBRIS_TABLE_LEN {
+            let ch = debris_glyph(i);
+            assert!(allowed.contains(&ch), "unexpected glyph {ch:?} at index {i}");
+        }
+        // Every glyph of the allowed set is present (weight ≥ 1); together
+        // with the loop above this also proves the table is non-empty.
+        for &ch in &allowed {
+            assert!(
+                (0..DEBRIS_TABLE_LEN).any(|i| debris_glyph(i) == ch),
+                "glyph {ch:?} missing from table"
+            );
+        }
+        // Out-of-range indices are safe — they wrap modulo the length.
+        for i in [DEBRIS_TABLE_LEN, DEBRIS_TABLE_LEN + 1, 1_000_000] {
+            assert!(allowed.contains(&debris_glyph(i)));
+        }
+    }
+
+    #[test]
+    fn debris_color_bounds() {
+        let mut pal = [(0u8, 0u8, 0u8); 37];
+        for (i, slot) in pal.iter_mut().enumerate() {
+            *slot = (i as u8, i as u8, i as u8); // the index is visible in the color
+        }
+        // idx below/above the bright half clamps into 18..=36.
+        for idx in [-5, 0, 17, 37, 40, 99] {
+            let c = debris_color(&pal, idx);
+            assert!(
+                (18..=36).contains(&(c.0 as i32)),
+                "idx={idx} escaped the bright half: color {c:?}"
+            );
+        }
+        // In-range indices pick the palette step verbatim.
+        assert_eq!(debris_color(&pal, 18), pal[18]);
+        assert_eq!(debris_color(&pal, 36), pal[36]);
+        assert_eq!(debris_color(&pal, 17), pal[18]);
+        assert_eq!(debris_color(&pal, 37), pal[36]);
     }
 }
