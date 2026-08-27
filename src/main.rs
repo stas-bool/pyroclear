@@ -95,6 +95,7 @@ fn main() {
         config::Effect::Fire => burn(&palette, &settings, interrupted),
         config::Effect::Ufo => ufo::run(&settings, interrupted),
         config::Effect::Crt => crt::run(&palette, &settings, interrupted),
+        config::Effect::Quake => quake::run(&palette, &settings, interrupted),
     }
 
     // Final clear — always runs, even after SIGINT (cursor was restored in burn)
