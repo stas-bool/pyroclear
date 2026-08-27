@@ -42,6 +42,45 @@ pub fn phase_at(t01: f32) -> Phase {
     }
 }
 
+/// Peak shake amplitude: 1 + height capped at 3 (spec §3.2: height 0..3 →
+/// 1..3 columns). Private — reachable through amp().
+fn amp_max(height: i32) -> i32 {
+    (1 + height.clamp(0, 3)).min(3)
+}
+
+/// Shake amplitude by normalized time (spec §3.2): ramps linearly 0 → AMP_MAX
+/// over Ramp-up, holds AMP_MAX through Quake, drops to 0 at the Quake /
+/// Crumble-out boundary. There is no fade-out phase and cannot be one: R_max
+/// strictly exceeds max|ecy − y| (any corner has dx ≥ cols/4 > 0, §3.3), so
+/// the wave breaks the last intact row before t = 0.70 — by Crumble-out there
+/// is nothing left to shake. The 0 also keeps a post-resize Crumble-out frame
+/// from re-shaking reset rows: target 0 compensates them back to 0.
+pub fn amp(t01: f32, height: i32) -> i32 {
+    let t = t01.clamp(0.0, 1.0);
+    let max = amp_max(height) as f32;
+    if t < PHASE_RAMP_END {
+        (t / PHASE_RAMP_END * max).round() as i32
+    } else if t < PHASE_QUAKE_END {
+        max as i32
+    } else {
+        0
+    }
+}
+
+/// The row-shift command from the accumulated offset `off` toward `target`
+/// (spec §3.2/§4): off < target → ICH (row content moves right), off > target
+/// → DCH (moves left), equal → None. Also used to compensate a row to 0 at
+/// break time: shake_cmd(row_off, 0).
+pub fn shake_cmd(off: i32, target: i32) -> Option<(bool, u32)> {
+    if off < target {
+        Some((true, (target - off) as u32))
+    } else if off > target {
+        Some((false, (off - target) as u32))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,5 +126,50 @@ mod tests {
             assert!(o >= prev, "phase regression at t={t}: {o} < {prev}");
             prev = o;
         }
+    }
+
+    #[test]
+    fn amp_shape() {
+        // Zero at the start; the peak sits inside Quake; a hard cut to 0 at
+        // the Quake/Crumble-out boundary — there is no fade-out phase (§3.2).
+        assert_eq!(amp(0.0, 2), 0);
+        assert_eq!(amp(0.12, 2), 3);
+        assert_eq!(amp(0.5, 2), 3);
+        assert_eq!(amp(0.699, 2), 3);
+        assert_eq!(amp(0.70, 2), 0);
+        assert_eq!(amp(0.88, 2), 0);
+        assert_eq!(amp(1.0, 2), 0);
+        // Monotone over the Ramp-up segment.
+        let mut prev = amp(0.0, 2);
+        for i in 1..=100 {
+            let t = PHASE_RAMP_END * i as f32 / 100.0;
+            let a = amp(t, 2);
+            assert!(a >= prev, "amp decreased at t={t}: {a} < {prev}");
+            prev = a;
+        }
+    }
+
+    #[test]
+    fn amp_height_scales() {
+        // height 0..3 → peak amplitude 1..3 columns (§3.2: AMP_MAX = 1 + height, cap 3).
+        assert_eq!(amp(0.5, 0), 1);
+        assert_eq!(amp(0.5, 1), 2);
+        assert_eq!(amp(0.5, 2), 3);
+        assert_eq!(amp(0.5, 3), 3); // capped
+        // Out-of-range heights clamp instead of panicking.
+        assert_eq!(amp(0.5, -1), 1);
+        assert_eq!(amp(0.5, 9), 3);
+    }
+
+    #[test]
+    fn shake_cmd_signs() {
+        // off < target → ICH (content moves right); off > target → DCH (left);
+        // equal → no command needed.
+        assert_eq!(shake_cmd(0, 2), Some((true, 2)));
+        assert_eq!(shake_cmd(2, 0), Some((false, 2)));
+        assert_eq!(shake_cmd(-1, 1), Some((true, 2)));
+        assert_eq!(shake_cmd(1, -1), Some((false, 2)));
+        assert_eq!(shake_cmd(0, 0), None);
+        assert_eq!(shake_cmd(3, 3), None);
     }
 }
