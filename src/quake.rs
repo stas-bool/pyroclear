@@ -81,6 +81,29 @@ pub fn shake_cmd(off: i32, target: i32) -> Option<(bool, u32)> {
     }
 }
 
+/// Seismic wave front radius (spec §3.3): `p_quake` is the Quake phase
+/// progress ∈ [0,1]; quadratic ease-out (fast start, slowing toward R_max), so
+/// the ring visibly decelerates. Clamps p outside [0,1].
+pub fn wave_radius(p_quake: f32, r_max: f32) -> f32 {
+    let p = p_quake.clamp(0.0, 1.0);
+    r_max * (1.0 - (1.0 - p) * (1.0 - p))
+}
+
+/// Elliptical distance with a 2:1 aspect (spec §3.3) — a circle on ~2:1
+/// terminal cells (same idea as rx = 2·ry craters in ufo.rs). The minimum
+/// over a row is on the epicenter's vertical, where dx = 0.
+pub fn epi_dist(x: i32, y: i32, ecx: i32, ecy: i32) -> f32 {
+    let dx = (x - ecx) as f32 / 2.0;
+    let dy = (y - ecy) as f32;
+    dx.hypot(dy)
+}
+
+/// Has the wave reached the row at vertical offset `dy` from the epicenter
+/// (spec §3.3)? The boundary is inclusive: |dy| ≤ r.
+pub fn row_reached(dy: i32, r: f32) -> bool {
+    (dy.abs() as f32) <= r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +194,63 @@ mod tests {
         assert_eq!(shake_cmd(1, -1), Some((false, 2)));
         assert_eq!(shake_cmd(0, 0), None);
         assert_eq!(shake_cmd(3, 3), None);
+    }
+
+    #[test]
+    fn wave_radius_bounds() {
+        let r_max = 12.5;
+        assert_eq!(wave_radius(0.0, r_max), 0.0);
+        assert_eq!(wave_radius(1.0, r_max), r_max);
+        // Monotone growth over the phase.
+        let mut prev = wave_radius(0.0, r_max);
+        for i in 1..=100 {
+            let p = i as f32 / 100.0;
+            let r = wave_radius(p, r_max);
+            assert!(r >= prev, "radius regressed at p={p}: {r} < {prev}");
+            prev = r;
+        }
+        // Outside [0,1] clamps.
+        assert_eq!(wave_radius(-0.5, r_max), 0.0);
+        assert_eq!(wave_radius(1.5, r_max), r_max);
+    }
+
+    #[test]
+    fn epi_dist_zero_at_epicenter() {
+        assert_eq!(epi_dist(10, 5, 10, 5), 0.0);
+    }
+
+    #[test]
+    fn epi_dist_aspect() {
+        // The minimum over a row sits on the epicenter's vertical (dx = 0).
+        let (ecx, ecy) = (40, 12);
+        let on_vertical = epi_dist(ecx, 4, ecx, ecy);
+        for dx in [-6, -2, 2, 6] {
+            assert!(
+                epi_dist(ecx + dx, 4, ecx, ecy) > on_vertical,
+                "dx={dx} must be farther than dx=0"
+            );
+        }
+        // 2:1 aspect: a shift of 2 columns equals a shift of 1 row.
+        assert_eq!(
+            epi_dist(ecx + 2, ecy, ecx, ecy),
+            epi_dist(ecx, ecy + 1, ecx, ecy)
+        );
+        assert_eq!(
+            epi_dist(ecx + 4, ecy, ecx, ecy),
+            epi_dist(ecx, ecy + 2, ecx, ecy)
+        );
+    }
+
+    #[test]
+    fn row_reached_edges() {
+        // The boundary is included: |dy| == r → true; |dy| == r + ε → false.
+        assert!(row_reached(3, 3.0));
+        assert!(row_reached(-3, 3.0));
+        assert!(!row_reached(4, 3.0));
+        assert!(!row_reached(-4, 3.0));
+        assert!(!row_reached(4, 3.9999));
+        // A zero-radius wave reaches only the epicenter row itself.
+        assert!(row_reached(0, 0.0));
+        assert!(!row_reached(1, 0.0));
     }
 }
