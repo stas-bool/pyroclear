@@ -11,9 +11,14 @@
 // broken) rows: those have no burned cells and an empty overlay, so there is
 // nothing to conflict with (model purity invariant, spec §3.2).
 
+use crate::engine::{terminal_size, Rng};
 use crate::palettes::Palette;
-use crate::ESC;
+use crate::{config::AnimSettings, ESC};
 use std::fmt::Write as _;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Earthquake phases (spec §2). Order matters — monotonic in t.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -239,6 +244,300 @@ fn render(buf: &mut String, grid: &[Option<Ov>], cols: usize, rows: usize) {
         }
     }
     let _ = write!(buf, "{ESC}[0m");
+}
+
+// ── Main-loop tuning constants (spec §3.7) ─────────────────────────────
+
+const MAX_AGE: u32 = 90; // hang-proof particle lifetime, frames
+const MAX_PARTICLES: usize = 600; // live particle cap
+const SHAKE_HOLD: u32 = 3; // frames between shake retargets (~20 Hz at 60 fps)
+const P_DETACH: f32 = 0.15; // per-cell detach probability per frame
+
+/// Probability of a second crumb from a detached cell (spec §3.4):
+/// 0.15 + 0.10·height (height 0..3 → 0.15..0.45 — "fewer than two" holds at
+/// every height). P_DETACH does not depend on height.
+fn p_second(height: i32) -> f32 {
+    0.15 + 0.10 * height.clamp(0, 3) as f32
+}
+
+/// Random float in [0, 1) on top of the integer PRNG (there is no rand crate).
+fn rand_f01(rng: &mut Rng) -> f32 {
+    (rng.next_u64() % 1_000_000) as f32 / 1_000_000.0
+}
+
+/// Random float in [lo, hi).
+fn rand_frng(rng: &mut Rng, lo: f32, hi: f32) -> f32 {
+    lo + rand_f01(rng) * (hi - lo)
+}
+
+/// Random epicenter in the middle half of the screen (spec §3.3):
+/// ecx ∈ [cols/4, 3·cols/4), ecy ∈ [rows/4, 3·rows/4) — a central band of
+/// 50% so the wave is guaranteed to reach the corners by t = 0.70.
+/// Rng::range is inclusive → the upper bound is 3·cols/4 − 1 to keep the
+/// half-open range (see risk R2).
+fn pick_epicenter(cols: i32, rows: i32, rng: &mut Rng) -> (i32, i32) {
+    (
+        rng.range(cols / 4, 3 * cols / 4 - 1),
+        rng.range(rows / 4, 3 * rows / 4 - 1),
+    )
+}
+
+/// Per-row shake counter phases, randomized so the rows jitter out of sync
+/// (spec §3.2: the counter phase differs per row, the frequency does not).
+fn fresh_hold_phases(rows: usize, rng: &mut Rng) -> Vec<u32> {
+    (0..rows)
+        .map(|_| rng.range(0, SHAKE_HOLD as i32 - 1) as u32)
+        .collect()
+}
+
+/// One crumb out of a cell (spec §3.4): position ± a small jitter,
+/// vx ∈ [−0.4, 0.4), vy ∈ [−0.3, 0.1) (a light toss upward), a glyph from
+/// the weighted table, a color from the bright half of the palette.
+fn new_particle(rng: &mut Rng, palette: &Palette, x: i32, y: i32) -> Particle {
+    Particle {
+        x: x as f32 + rand_frng(rng, -0.3, 0.3),
+        y: y as f32 + rand_frng(rng, -0.3, 0.3),
+        vx: rand_frng(rng, -0.4, 0.4),
+        vy: rand_frng(rng, -0.3, 0.1),
+        ch: debris_glyph(rng.range(0, DEBRIS_TABLE_LEN as i32) as usize),
+        color: debris_color(palette, rng.range(18, 36)),
+        age: 0,
+    }
+}
+
+/// Debris spawn from a detached cell (spec §3.4): one crumb, plus a second
+/// with probability P_SECOND. Over the cap the spawn is simply skipped —
+/// the crumble itself is never blocked.
+fn spawn_debris(
+    particles: &mut Vec<Particle>,
+    rng: &mut Rng,
+    palette: &Palette,
+    x: i32,
+    y: i32,
+    height: i32,
+) {
+    if particles.len() >= MAX_PARTICLES {
+        return;
+    }
+    particles.push(new_particle(rng, palette, x, y));
+    if particles.len() < MAX_PARTICLES && rand_f01(rng) < p_second(height) {
+        particles.push(new_particle(rng, palette, x, y));
+    }
+}
+
+// ── Main loop ──────────────────────────────────────────────────────────
+
+pub fn run(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicBool>) {
+    let (mut cols, mut rows) = terminal_size();
+    // Too small to bother — main() does the final clear anyway (spec §7).
+    if cols < 8 || rows < 4 {
+        return;
+    }
+    let fps = settings.fps.max(1) as u64;
+    let frame_delay = Duration::from_millis(1000 / fps);
+    // Clamp the duration from below to 0.6 s (spec §2) — otherwise the four
+    // phases collapse into under a frame each.
+    let t = Duration::from_secs_f32(settings.duration.max(0.6));
+
+    let mut rng = Rng::new();
+    let (mut ecx, mut ecy) = pick_epicenter(cols as i32, rows as i32, &mut rng);
+    let mut burned = vec![false; cols * rows];
+    let mut grid: Vec<Option<Ov>> = vec![None; cols * rows];
+    let mut row_off = vec![0i32; rows]; // accumulated row shift, in columns
+    let mut row_target = vec![0i32; rows];
+    let mut row_hold = fresh_hold_phases(rows, &mut rng);
+    let mut row_broken = vec![false; rows];
+    let mut particles: Vec<Particle> = Vec::new();
+    let mut buf = String::with_capacity(cols * rows * 6);
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let _ = write!(out, "{ESC}[?25l"); // hide cursor
+    let _ = out.flush();
+
+    let start = Instant::now();
+    loop {
+        if interrupted.load(Ordering::Relaxed) {
+            break;
+        }
+        let elapsed = start.elapsed();
+        if elapsed > t {
+            break;
+        }
+
+        // Live resize (spec §7): the state is recreated, `t` is NOT reset —
+        // the animation plays out to the new geometry.
+        let (nc, nr) = terminal_size();
+        if nc != cols || nr != rows {
+            cols = nc;
+            rows = nr;
+            if cols < 8 || rows < 4 {
+                break;
+            }
+            burned = vec![false; cols * rows];
+            grid = vec![None; cols * rows];
+            row_off = vec![0; rows];
+            row_target = vec![0; rows];
+            row_hold = fresh_hold_phases(rows, &mut rng);
+            row_broken = vec![false; rows];
+            particles.clear();
+            (ecx, ecy) = pick_epicenter(cols as i32, rows as i32, &mut rng);
+            buf.reserve(cols * rows * 6);
+        }
+        let (ci, ri) = (cols as i32, rows as i32);
+
+        // Reset the overlay for this frame.
+        for cell in grid.iter_mut() {
+            *cell = None;
+        }
+
+        // Normalized frame time, phase, wave front.
+        let t01 = (elapsed.as_secs_f32() / t.as_secs_f32()).clamp(0.0, 1.0);
+        let phase = phase_at(t01);
+        let p_quake =
+            ((t01 - PHASE_RAMP_END) / (PHASE_QUAKE_END - PHASE_RAMP_END)).clamp(0.0, 1.0);
+        // R_max — the max elliptical distance from the epicenter to a screen
+        // corner (spec §3.3). Strictly exceeds max|ecy − y|: any corner has
+        // dx >= cols/4 > 0, so the wave breaks the last intact row before the
+        // end of Quake.
+        let r_max = epi_dist(0, 0, ecx, ecy)
+            .max(epi_dist(ci - 1, 0, ecx, ecy))
+            .max(epi_dist(0, ri - 1, ecx, ecy))
+            .max(epi_dist(ci - 1, ri - 1, ecx, ecy));
+        // The wave exists only from Quake onward (spec §2: during Ramp-up the
+        // screen stays intact). With r = 0 the |dy| <= r check would break the
+        // epicenter row on the very first frame; r = −1 keeps every row
+        // intact and every cell out of the detach radius (see risk R5).
+        let r = if matches!(phase, Phase::RampUp) {
+            -1.0
+        } else {
+            wave_radius(p_quake, r_max)
+        };
+        let a = amp(t01, settings.height);
+        let settle = t01 >= PHASE_CRUMBLE_END;
+
+        buf.clear();
+
+        // (1) Row breaking (spec §3.3): first contact is on the epicenter's
+        // vertical, where dx = 0 — hence |ecy − y| <= r. The accumulated row
+        // shift is compensated to 0 with a single ICH/DCH (spec §3.2); from
+        // here on the row lives in the overlay model's clean coordinates.
+        for y in 0..ri {
+            let yi = y as usize;
+            if row_broken[yi] || !row_reached(ecy - y, r) {
+                continue;
+            }
+            if let Some((is_ich, n)) = shake_cmd(row_off[yi], 0) {
+                if is_ich {
+                    let _ = write!(buf, "{ESC}[{};1H{ESC}[{n}@", y + 1);
+                } else {
+                    let _ = write!(buf, "{ESC}[{};1H{ESC}[{n}P", y + 1);
+                }
+            }
+            row_off[yi] = 0;
+            row_broken[yi] = true;
+        }
+
+        // (2) Shaking the intact rows (spec §3.2): the target changes once
+        // per SHAKE_HOLD frames (≈20 Hz at 60 fps — a rattle, not white
+        // noise). ICH/DCH only ever hits intact rows — there the overlay is
+        // empty and no cell is burned, so the bare user text shakes.
+        for y in 0..ri {
+            let yi = y as usize;
+            if row_broken[yi] {
+                continue; // a destroyed row cannot shake as a whole
+            }
+            row_hold[yi] += 1;
+            if row_hold[yi] >= SHAKE_HOLD {
+                row_hold[yi] = 0;
+                // The range itself grows with amp(t) over Ramp-up; after
+                // Quake a = 0 → target 0 (compensation, matters after a
+                // mid-Crumble-out resize resets the rows).
+                row_target[yi] = rng.range(-a, a);
+            }
+            if let Some((is_ich, n)) = shake_cmd(row_off[yi], row_target[yi]) {
+                if is_ich {
+                    let _ = write!(buf, "{ESC}[{};1H{ESC}[{n}@", y + 1);
+                } else {
+                    let _ = write!(buf, "{ESC}[{};1H{ESC}[{n}P", y + 1);
+                }
+            }
+            row_off[yi] = row_target[yi];
+        }
+
+        // (3) Crumble. From Settle on, every cell of the screen is
+        // force-marked burned with no regard for row_broken (a late resize
+        // in Settle resets row_broken — the cleanup must survive it) and
+        // with no spawn (spec §3.3). Before that, cells of broken rows
+        // inside the front detach with probability P_DETACH per frame.
+        if settle {
+            for cell in burned.iter_mut() {
+                *cell = true;
+            }
+        } else {
+            for y in 0..ri {
+                if !row_broken[y as usize] {
+                    continue;
+                }
+                for x in 0..ci {
+                    let cell = y as usize * cols + x as usize;
+                    if burned[cell] || epi_dist(x, y, ecx, ecy) > r {
+                        continue;
+                    }
+                    if rand_f01(&mut rng) < P_DETACH {
+                        burned[cell] = true;
+                        spawn_debris(
+                            &mut particles,
+                            &mut rng,
+                            palette,
+                            x,
+                            y,
+                            settings.height,
+                        );
+                    }
+                }
+            }
+        }
+
+        // (4) Particles: step, then death by the frame's final position
+        // (checked before drawing — only live crumbs are drawn, spec §3.4).
+        for p in particles.iter_mut() {
+            step_particle(p, settings.wind);
+            p.age += 1;
+        }
+        particles
+            .retain(|p| !(p.age > MAX_AGE || particle_dies(p.y.floor() as i32, ri, &row_broken)));
+
+        // (5) Frame assembly (spec §3.2): the shake prefix is already in
+        // buf; now the erase layer over burned cells, crumbs on top, then
+        // ONE write_all.
+        for y in 0..ri {
+            for x in 0..ci {
+                if burned[y as usize * cols + x as usize] {
+                    stamp(&mut grid, ci, ri, x, y, Ov { ch: ' ', color: None });
+                }
+            }
+        }
+        for p in particles.iter() {
+            let px = p.x.round() as i32;
+            let py = p.y.floor() as i32;
+            // A crumb burns every cell it is drawn in (spec §3.4): the last
+            // frame's position is erased by the next frame's erase layer —
+            // no trails.
+            burn(&mut burned, ci, ri, px, py);
+            stamp(&mut grid, ci, ri, px, py, Ov { ch: p.ch, color: Some(p.color) });
+        }
+
+        render(&mut buf, &grid, cols, rows);
+        let _ = out.write_all(buf.as_bytes());
+        let _ = out.flush();
+        std::thread::sleep(frame_delay);
+    }
+
+    // Always restore the cursor — main() does the final clear (it also covers
+    // any accumulated row shifts left over after an interrupt, spec §7).
+    let _ = write!(out, "{ESC}[?25h");
+    let _ = out.flush();
 }
 
 #[cfg(test)]
