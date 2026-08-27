@@ -132,7 +132,7 @@ const DEBRIS_TABLE_LEN: usize = DEBRIS_TABLE.len();
 
 /// Debris glyph by index into the weighted table (spec §4). Safe for any idx:
 /// taken modulo the length, so the inclusive Rng::range can never go out of
-/// bounds (same safety as glyph_at in crt.rs; see risk R2).
+/// bounds (same safety as glyph_at in crt.rs, spec §3.4).
 pub fn debris_glyph(idx: usize) -> char {
     DEBRIS_TABLE[idx % DEBRIS_TABLE_LEN]
 }
@@ -274,7 +274,7 @@ fn rand_frng(rng: &mut Rng, lo: f32, hi: f32) -> f32 {
 /// ecx ∈ [cols/4, 3·cols/4), ecy ∈ [rows/4, 3·rows/4) — a central band of
 /// 50% so the wave is guaranteed to reach the corners by t = 0.70.
 /// Rng::range is inclusive → the upper bound is 3·cols/4 − 1 to keep the
-/// half-open range (see risk R2).
+/// half-open range of spec §3.3.
 fn pick_epicenter(cols: i32, rows: i32, rng: &mut Rng) -> (i32, i32) {
     (
         rng.range(cols / 4, 3 * cols / 4 - 1),
@@ -407,7 +407,8 @@ pub fn run(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicBo
         // The wave exists only from Quake onward (spec §2: during Ramp-up the
         // screen stays intact). With r = 0 the |dy| <= r check would break the
         // epicenter row on the very first frame; r = −1 keeps every row
-        // intact and every cell out of the detach radius (see risk R5).
+        // intact and every cell out of the detach radius (spec §3.3: the
+        // front only starts growing at the beginning of Quake).
         let r = if matches!(phase, Phase::RampUp) {
             -1.0
         } else {
@@ -475,11 +476,19 @@ pub fn run(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicBo
                 *cell = true;
             }
         } else {
+            // A cell with |x − ecx| > 2r is beyond the front on ANY row (the
+            // dx/2 term alone exceeds r), so the scan only needs the columns
+            // the front can physically reach. The +2 margin covers the
+            // f32→i32 truncation and rounding at the boundary; epi_dist below
+            // stays the exact gate, so behavior is unchanged.
+            let reach = (2.0 * r) as i32 + 2;
+            let x_lo = (ecx - reach).max(0);
+            let x_hi = (ecx + reach + 1).min(ci);
             for y in 0..ri {
                 if !row_broken[y as usize] {
                     continue;
                 }
-                for x in 0..ci {
+                for x in x_lo..x_hi {
                     let cell = y as usize * cols + x as usize;
                     if burned[cell] || epi_dist(x, y, ecx, ecy) > r {
                         continue;
@@ -531,6 +540,13 @@ pub fn run(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicBo
         render(&mut buf, &grid, cols, rows);
         let _ = out.write_all(buf.as_bytes());
         let _ = out.flush();
+        // Settle with no live particles: every cell is burned, so every
+        // further frame would be a pixel-identical full-screen rewrite —
+        // end early (the screen is already blank, spec §2 "quiet and
+        // empty"; the final clear is done by main()).
+        if settle && particles.is_empty() {
+            break;
+        }
         std::thread::sleep(frame_delay);
     }
 
