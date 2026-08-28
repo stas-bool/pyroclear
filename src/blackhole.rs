@@ -100,6 +100,41 @@ pub fn devour_cmds(left: i32, right: i32, rate: u32) -> (u32, u32) {
     (nl, nl + nr)
 }
 
+// ── Hole growth + flash (spec §3.3/§3.5) ──────────────────────────────
+
+/// The eaten mass that fills the hole to cap by ~2/3 of Attraction
+/// (spec §3.3): k = cap / (MASS_FRACTION·cols·rows).
+const MASS_FRACTION: f32 = 0.65;
+
+/// The hole's vertical semi-radius by normalized time and devoured mass
+/// (spec §3.3); the horizontal radius is ×2 (2:1 cell aspect, as the ufo
+/// craters). Emergence: linear 1 → 2. Attraction: min(k·eaten, cap) — the
+/// devoured mass grows the hole; cap = max(rows/(7 − height), 2) (bigger
+/// with height, floored for mini terminals). Collapse: quadratic ease-in
+/// cap → 1. Flash: linear 1 → 0. Monotone within each phase.
+pub fn hole_ry(t01: f32, eaten: u32, cols: usize, rows: usize, height: i32) -> f32 {
+    let t = t01.clamp(0.0, 1.0);
+    let cap = ((rows as i32) / (7 - height.clamp(0, 3))).max(2) as f32;
+    if t < PHASE_EMERGE_END {
+        1.0 + t / PHASE_EMERGE_END
+    } else if t < PHASE_ATTRACT_END {
+        let k = cap / (MASS_FRACTION * (cols * rows) as f32);
+        (k * eaten as f32).min(cap)
+    } else if t < PHASE_COLLAPSE_END {
+        let p = (t - PHASE_ATTRACT_END) / (PHASE_COLLAPSE_END - PHASE_ATTRACT_END);
+        cap + (1.0 - cap) * p * p
+    } else {
+        1.0 - (t - PHASE_COLLAPSE_END) / (1.0 - PHASE_COLLAPSE_END)
+    }
+}
+
+/// The flash ring radius (spec §3.5): `p_flash` is the Flash phase progress
+/// ∈ [0,1]; quadratic ease-out (as the wave front). 0 → 0, 1 → r_max.
+pub fn flash_radius(p_flash: f32, r_max: f32) -> f32 {
+    let p = p_flash.clamp(0.0, 1.0);
+    r_max * (1.0 - (1.0 - p) * (1.0 - p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +276,81 @@ mod tests {
         assert_eq!(devour_cmds(0, 7, 3), (0, 3));
         // A drained row → nothing at all.
         assert_eq!(devour_cmds(0, 0, 5), (0, 0));
+    }
+
+    #[test]
+    fn hole_ry_growth_and_cap() {
+        // Emergence: linear 1 → 2, monotone.
+        assert_eq!(hole_ry(0.0, 0, 80, 24, 1), 1.0);
+        let mut prev = hole_ry(0.0, 0, 80, 24, 1);
+        for i in 1..=50 {
+            let t = PHASE_EMERGE_END * i as f32 / 50.0;
+            let r = hole_ry(t, 5_000, 80, 24, 1);
+            assert!(r >= prev, "hole shrank inside Emergence at t={t}: {r} < {prev}");
+            prev = r;
+        }
+        // Attraction: monotone in eaten, saturating at cap = max(rows/(7−h), 2).
+        let cap = (24.0f32 / 6.0).floor().max(2.0); // height = 1 → 24/6 = 4
+        let mut prev = hole_ry(0.4, 0, 80, 24, 1);
+        for eaten in [1u32, 50, 500, 2_000, 10_000, 1_000_000] {
+            let r = hole_ry(0.4, eaten, 80, 24, 1);
+            assert!(r >= prev, "hole shrank as eaten grew: {r} < {prev}");
+            assert!(r <= cap, "cap exceeded: {r} > {cap}");
+            prev = r;
+        }
+        assert_eq!(prev, cap); // saturated at cap
+        // Mini terminals rows 4..6: integer division would give 0–1 — the
+        // floor keeps cap ≥ 2 (spec §3.3), so Emergence's 1 → 2 never exceeds it.
+        for rows in [4usize, 5, 6] {
+            for height in 0..=3 {
+                assert_eq!(hole_ry(0.5, 1_000_000, 20, rows, height), 2.0);
+            }
+        }
+        // Collapse: ease-in cap → 1, monotone shrink.
+        let mut prev = hole_ry(PHASE_ATTRACT_END, 1_000_000, 80, 24, 1);
+        for i in 1..=50 {
+            let t = PHASE_ATTRACT_END + (PHASE_COLLAPSE_END - PHASE_ATTRACT_END) * i as f32 / 50.0;
+            let r = hole_ry(t, 1_000_000, 80, 24, 1);
+            assert!(r <= prev, "hole grew inside Collapse at t={t}: {r} > {prev}");
+            prev = r;
+        }
+        assert!((prev - 1.0).abs() < 1e-6, "Collapse must end at 1.0, got {prev}");
+        // Flash: 1 → 0.
+        assert!((hole_ry(PHASE_COLLAPSE_END, 1_000_000, 80, 24, 1) - 1.0).abs() < 1e-6);
+        assert!(hole_ry(1.0, 1_000_000, 80, 24, 1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hole_ry_height_scales() {
+        // cap = max(rows/(7−height), 2) grows with height (integer division).
+        let mut prev = hole_ry(0.5, 1_000_000, 80, 24, -1); // clamped to 0
+        for height in 0..=3 {
+            let r = hole_ry(0.5, 1_000_000, 80, 24, height);
+            assert!(r >= prev, "cap must not shrink as height grows");
+            prev = r;
+        }
+        // Exact caps for rows = 24: h 0..3 → 3, 4, 4, 6.
+        assert_eq!(hole_ry(0.5, 1_000_000, 80, 24, 0), 3.0);
+        assert_eq!(hole_ry(0.5, 1_000_000, 80, 24, 1), 4.0);
+        assert_eq!(hole_ry(0.5, 1_000_000, 80, 24, 2), 4.0);
+        assert_eq!(hole_ry(0.5, 1_000_000, 80, 24, 3), 6.0);
+    }
+
+    #[test]
+    fn flash_radius_bounds() {
+        let r_max = 21.5;
+        assert_eq!(flash_radius(0.0, r_max), 0.0);
+        assert_eq!(flash_radius(1.0, r_max), r_max);
+        // Monotone growth over the phase.
+        let mut prev = flash_radius(0.0, r_max);
+        for i in 1..=100 {
+            let p = i as f32 / 100.0;
+            let r = flash_radius(p, r_max);
+            assert!(r >= prev, "ring regressed at p={p}: {r} < {prev}");
+            prev = r;
+        }
+        // Outside [0,1] clamps.
+        assert_eq!(flash_radius(-0.5, r_max), 0.0);
+        assert_eq!(flash_radius(1.5, r_max), r_max);
     }
 }
