@@ -21,6 +21,7 @@
 //   crt       — CRT TV power-off effect
 //   quake     — earthquake effect (ICH/DCH shake, seismic wave, debris)
 //   blackhole — black hole effect (ICH/DCH text pull, accretion disk, flash)
+//   glitch    — digital glitch effect (ICH/DCH jolts and tears, noise bands, DECSCNM flashes)
 //   tui       — raw terminal, key input, picker & settings TUIs
 //   win       — hand-rolled Win32 console bindings (Windows only)
 
@@ -36,6 +37,7 @@ pub mod config;
 pub mod crt;
 pub mod display;
 pub mod engine;
+pub mod glitch;
 pub mod palettes;
 pub mod quake;
 pub mod tui;
@@ -102,6 +104,7 @@ fn main() {
         config::Effect::Crt => crt::run(&palette, &settings, interrupted),
         config::Effect::Quake => quake::run(&palette, &settings, interrupted),
         config::Effect::Blackhole => blackhole::run(&palette, &settings, interrupted),
+        config::Effect::Glitch => glitch::run(&palette, &settings, interrupted),
     }
 
     // Final clear — always runs, even after SIGINT (cursor was restored in burn)

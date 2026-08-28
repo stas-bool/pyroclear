@@ -1,6 +1,6 @@
 # pyroclear
 
-A terminal `clear` replacement that animates your screen away before wiping it: Doom fire, a UFO laser sweep, a CRT power-off, an earthquake, or a black hole devouring your text.
+A terminal `clear` replacement that animates your screen away before wiping it: Doom fire, a UFO laser sweep, a CRT power-off, an earthquake, a black hole devouring your text, or a digital glitch tearing it apart.
 
 Written in modern Rust. Zero runtime dependencies beyond standard `libc` (Unix) or native Win32 API calls (Windows). Highly optimized, flicker-free, and customizable!
 
@@ -112,7 +112,7 @@ pyroclear [OPTIONS]
 | Option | Description | Example |
 | :--- | :--- | :--- |
 | **`--start`** | Open the onboarding presentation & guide | `pyroclear --start` |
-| **`--effect <name>`** | Run a specific effect: `fire`, `ufo`, `crt`, `quake`, `blackhole`, or `random` (saves as default) | `pyroclear --effect blackhole` |
+| **`--effect <name>`** | Run a specific effect: `fire`, `ufo`, `crt`, `quake`, `blackhole`, `glitch`, or `random` (saves as default) | `pyroclear --effect blackhole` |
 | **`--settings`, `-s`** | Adjust FPS, wind direction, animation durations, and flame height decay | `pyroclear --settings` |
 | **`--pick`, `-p`** | Interactive color palette picker with live swatches | `pyroclear --pick` |
 | **`--custom`** | TUI to save, name, manage and run custom gradients | `pyroclear --custom` |
