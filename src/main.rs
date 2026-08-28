@@ -103,6 +103,7 @@ fn main() {
         config::Effect::Crt => crt::run(&palette, &settings, interrupted),
         config::Effect::Quake => quake::run(&palette, &settings, interrupted),
         config::Effect::Blackhole => blackhole::run(&palette, &settings, interrupted),
+        config::Effect::Glitch => glitch::run(&palette, &settings, interrupted),
     }
 
     // Final clear — always runs, even after SIGINT (cursor was restored in burn)
