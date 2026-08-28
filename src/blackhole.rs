@@ -16,6 +16,8 @@
 // entirely empty, so the current frame's commands never touch cells the
 // overlay paints (model purity invariant, spec §3.2).
 
+use crate::palettes::Palette;
+
 /// Black hole phases (spec §2). Order matters — monotonic in t.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
@@ -133,6 +135,56 @@ pub fn hole_ry(t01: f32, eaten: u32, cols: usize, rows: usize, height: i32) -> f
 pub fn flash_radius(p_flash: f32, r_max: f32) -> f32 {
     let p = p_flash.clamp(0.0, 1.0);
     r_max * (1.0 - (1.0 - p) * (1.0 - p))
+}
+
+// ── Disk glyphs + colors (spec §3.4) ──────────────────────────────────
+
+/// Weighted disk glyph table (spec §3.4): '·'×4, '∙'×2, '•'×2, '⋆'×2,
+/// '˙'×2, '✦'×1. Sum of weights = 13.
+const DISK_TABLE: &[char] = &[
+    '·', '·', '·', '·',
+    '∙', '∙',
+    '•', '•',
+    '⋆', '⋆',
+    '˙', '˙',
+    '✦',
+];
+const DISK_TABLE_LEN: usize = DISK_TABLE.len();
+
+/// Disk glyph by index into the weighted table (spec §4). Safe for any idx:
+/// taken modulo the length, so the inclusive Rng::range can never go out of
+/// bounds (same safety as glyph_at in crt.rs, spec §3.4).
+pub fn disk_glyph(idx: usize) -> char {
+    DISK_TABLE[idx % DISK_TABLE_LEN]
+}
+
+/// Disk particle color (spec §3.4): idx is clamped into 9..=36 — the bright
+/// palette half 18..=36 at the disk's inner edge, the dim band 9..=17 at the
+/// outer edge. Direct index, no soften() — the palette is already softened
+/// in config::build_palette.
+pub fn disk_color(palette: &Palette, idx: i32) -> (u8, u8, u8) {
+    palette[idx.clamp(9, 36) as usize]
+}
+
+// ── Elliptic geometry (spec §4) ───────────────────────────────────────
+
+/// Elliptical distance with a 2:1 aspect (spec §4) — a circle on ~2:1
+/// terminal cells, the same metric as ufo::ring_cells. The hole core is the
+/// set aspect_dist ≤ hole_ry; the minimum over a row sits on the center
+/// vertical, where dx = 0.
+pub fn aspect_dist(x: i32, y: i32, cx: i32, cy: i32) -> f32 {
+    let dx = (x - cx) as f32 / 2.0;
+    let dy = (y - cy) as f32;
+    dx.hypot(dy)
+}
+
+/// Position on a 2:1 ellipse orbit (spec §3.4):
+/// (cx + 2·radius·cos(angle), cy + radius·sin(angle)).
+pub fn orbit_pos(cx: i32, cy: i32, angle: f32, radius: f32) -> (f32, f32) {
+    (
+        cx as f32 + 2.0 * radius * angle.cos(),
+        cy as f32 + radius * angle.sin(),
+    )
 }
 
 #[cfg(test)]
@@ -352,5 +404,88 @@ mod tests {
         // Outside [0,1] clamps.
         assert_eq!(flash_radius(-0.5, r_max), 0.0);
         assert_eq!(flash_radius(1.5, r_max), r_max);
+    }
+
+    #[test]
+    fn aspect_dist_shape() {
+        assert_eq!(aspect_dist(10, 5, 10, 5), 0.0);
+        // 2:1 aspect: a shift of 2 columns equals a shift of 1 row.
+        assert_eq!(aspect_dist(12, 5, 10, 5), aspect_dist(10, 6, 10, 5));
+        assert_eq!(aspect_dist(8, 5, 10, 5), aspect_dist(10, 4, 10, 5));
+        assert_eq!(aspect_dist(14, 5, 10, 5), aspect_dist(10, 7, 10, 5));
+        // The minimum over a row sits on the center vertical (dx = 0).
+        let on_vertical = aspect_dist(10, 3, 10, 5);
+        for dx in [-6, -2, 2, 6] {
+            assert!(
+                aspect_dist(10 + dx, 3, 10, 5) > on_vertical,
+                "dx={dx} must be farther than dx=0"
+            );
+        }
+    }
+
+    #[test]
+    fn orbit_pos_aspect() {
+        // radius = 1: angle 0 → (cx + 2, cy); π/2 → (cx, cy + 1) — an
+        // ellipse with rx = 2·ry (spec §8).
+        let (x, y) = orbit_pos(40, 12, 0.0, 1.0);
+        assert_eq!(x, 42.0);
+        assert_eq!(y, 12.0);
+        let (x, y) = orbit_pos(40, 12, std::f32::consts::FRAC_PI_2, 1.0);
+        assert!((x - 40.0).abs() < 1e-5, "x drifted: {x}");
+        assert!((y - 13.0).abs() < 1e-5, "y drifted: {y}");
+        // The radius scales both semi-axes (rx = 2r).
+        let (x, _) = orbit_pos(40, 12, 0.0, 3.0);
+        assert_eq!(x, 46.0);
+    }
+
+    #[test]
+    fn disk_table_len_is_thirteen() {
+        // Sum of weights: 4+2+2+2+2+1 = 13 (§3.4).
+        assert_eq!(DISK_TABLE_LEN, 13);
+    }
+
+    #[test]
+    fn disk_glyph_valid() {
+        let allowed = ['·', '∙', '•', '⋆', '˙', '✦'];
+        // Every index in [0, LEN) maps into the allowed set.
+        for i in 0..DISK_TABLE_LEN {
+            let ch = disk_glyph(i);
+            assert!(allowed.contains(&ch), "unexpected glyph {ch:?} at index {i}");
+        }
+        // Every glyph of the allowed set is present (weight ≥ 1); together
+        // with the loop above this also proves the table is non-empty.
+        for &ch in &allowed {
+            assert!(
+                (0..DISK_TABLE_LEN).any(|i| disk_glyph(i) == ch),
+                "glyph {ch:?} missing from table"
+            );
+        }
+        // Out-of-range indices are safe — they wrap modulo the length
+        // (the inclusive Rng::range can return LEN itself).
+        for i in [DISK_TABLE_LEN, DISK_TABLE_LEN + 1, 1_000_000] {
+            assert!(allowed.contains(&disk_glyph(i)));
+        }
+    }
+
+    #[test]
+    fn disk_color_bounds() {
+        let mut pal = [(0u8, 0u8, 0u8); 37];
+        for (i, slot) in pal.iter_mut().enumerate() {
+            *slot = (i as u8, i as u8, i as u8); // the index is visible in the color
+        }
+        // idx below/above the band clamps into 9..=36 (bright half 18..=36 at
+        // the inner edge, dim band 9..=17 at the outer edge, §3.4).
+        for idx in [-5, 0, 8, 37, 40, 99] {
+            let c = disk_color(&pal, idx);
+            assert!(
+                (9..=36).contains(&(c.0 as i32)),
+                "idx={idx} escaped the band: color {c:?}"
+            );
+        }
+        // In-range indices pick the palette step verbatim.
+        assert_eq!(disk_color(&pal, 9), pal[9]);
+        assert_eq!(disk_color(&pal, 36), pal[36]);
+        assert_eq!(disk_color(&pal, 8), pal[9]);
+        assert_eq!(disk_color(&pal, 37), pal[36]);
     }
 }
