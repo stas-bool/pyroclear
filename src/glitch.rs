@@ -127,6 +127,32 @@ pub fn tear_cmds(a: i32, w: i32, d: i32, cols: i32) -> (Option<Cmd>, Option<Cmd>
     }
 }
 
+/// Damage front radius in rows (spec §3.7): `p` is the progress over
+/// Tearing+Chaos ∈ [0,1]; quadratic ease-out (fast start, slowing — the
+/// same curve as quake's wave_radius and blackhole's pull_front). p = 0 →
+/// 0, p = 1 → the full screen height; monotone. Clamps p outside [0,1].
+pub fn damage_front(p: f32, rows: i32) -> f32 {
+    let p = p.clamp(0.0, 1.0);
+    rows as f32 * (1.0 - (1.0 - p) * (1.0 - p))
+}
+
+/// Does the row belong to the damage front band (spec §3.7)? `direction`:
+/// 0 (default) bottom → up, 1 top → down, 2 center → out, 3 edges →
+/// center. Boundaries are inclusive (as row_reached in quake). Deliberate
+/// deviation from the global setting labels (config.rs: 2 = Left→Right,
+/// 3 = Right→Left): the glitch wave stays vertical — the same precedent
+/// as blackhole reading `direction != 0` as a spin flag.
+pub fn wave_row_bias(y: i32, rows: i32, direction: u8, front: f32) -> bool {
+    let fy = y as f32;
+    let frows = rows as f32;
+    match direction {
+        1 => fy <= front, // top → down
+        2 => (fy - (frows - 1.0) / 2.0).abs() <= front, // center → out
+        3 => fy.min(frows - 1.0 - fy) <= front,         // edges → center
+        _ => frows - 1.0 - fy <= front,                 // 0 (default): bottom → up
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +349,60 @@ mod tests {
         let (c1, c2) = (c1.unwrap(), c2.unwrap());
         assert_eq!((c1.is_ich, c1.x), (false, 3));
         assert_eq!((c2.is_ich, c2.x), (true, 5));
+    }
+
+    #[test]
+    fn damage_front_bounds() {
+        // p=0 → 0; p=1 → the full screen height; monotone in between;
+        // outside [0,1] clamps.
+        assert_eq!(damage_front(0.0, 24), 0.0);
+        assert_eq!(damage_front(1.0, 24), 24.0);
+        let mut prev = damage_front(0.0, 24);
+        for i in 1..=100 {
+            let p = i as f32 / 100.0;
+            let f = damage_front(p, 24);
+            assert!(f >= prev, "front regressed at p={p}: {f} < {prev}");
+            prev = f;
+        }
+        assert_eq!(damage_front(-0.5, 24), 0.0);
+        assert_eq!(damage_front(1.5, 24), 24.0);
+    }
+
+    #[test]
+    fn wave_row_bias_directions() {
+        // rows=24, front=6.0 — the four directions give different row sets.
+        let (rows, front) = (24, 6.0f32);
+        // 0 (default): bottom → up — the bottom band only. The boundary is
+        // inclusive: 23−17 = 6 ≤ front → row 17 is ON the front.
+        assert!(wave_row_bias(23, rows, 0, front));
+        assert!(wave_row_bias(17, rows, 0, front));
+        assert!(!wave_row_bias(16, rows, 0, front));
+        assert!(!wave_row_bias(0, rows, 0, front));
+        // 1: top → down — the top band only.
+        assert!(wave_row_bias(0, rows, 1, front));
+        assert!(!wave_row_bias(23, rows, 1, front));
+        // 2: center → out — a band around the middle, edges untouched.
+        assert!(wave_row_bias(11, rows, 2, front));
+        assert!(wave_row_bias(17, rows, 2, front));
+        assert!(!wave_row_bias(5, rows, 2, front));
+        assert!(!wave_row_bias(0, rows, 2, front));
+        assert!(!wave_row_bias(23, rows, 2, front));
+        // 3: edges → center — both edges damaged, the middle not yet.
+        assert!(wave_row_bias(0, rows, 3, front));
+        assert!(wave_row_bias(23, rows, 3, front));
+        assert!(!wave_row_bias(12, rows, 3, front));
+        // The four directions really differ on the same front.
+        assert_ne!(
+            wave_row_bias(23, rows, 0, front),
+            wave_row_bias(23, rows, 1, front)
+        );
+        assert_ne!(
+            wave_row_bias(0, rows, 2, front),
+            wave_row_bias(0, rows, 3, front)
+        );
+        // Growth from front=0: direction 0 starts at the bottom row alone.
+        assert!(wave_row_bias(23, rows, 0, 0.0));
+        assert!(!wave_row_bias(22, rows, 0, 0.0));
+        assert!(!wave_row_bias(0, rows, 0, 0.0));
     }
 }
