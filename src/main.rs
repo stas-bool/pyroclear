@@ -20,6 +20,7 @@
 //   ufo       — UFO flyby effect (lasers, craters, shockwaves)
 //   crt       — CRT TV power-off effect
 //   quake     — earthquake effect (ICH/DCH shake, seismic wave, debris)
+//   blackhole — black hole effect (ICH/DCH text pull, accretion disk, flash)
 //   tui       — raw terminal, key input, picker & settings TUIs
 //   win       — hand-rolled Win32 console bindings (Windows only)
 
