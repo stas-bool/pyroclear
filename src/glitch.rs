@@ -82,6 +82,51 @@ pub fn shake_cmd(off: i32, target: i32) -> Option<(bool, u32)> {
     }
 }
 
+/// One ICH/DCH command of a tear pair (spec §3.4). Logical coordinates are
+/// 0-based as everywhere in the model; the emitter writes x + 1 (as y + 1
+/// in quake).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Cmd {
+    pub x: i32,       // 0-based column the command runs at
+    pub is_ich: bool, // true → ESC[n@ (insert), false → ESC[nP (delete)
+    pub n: u32,       // cell count
+}
+
+/// The tear command pair (spec §3.4): the window [a, a+w) of a row shifts
+/// by d; the cells outside the window stay, |d| cells in the direction of
+/// travel are lost. Unified formula: the first command runs at
+/// x1 = min(a, a+d), the second at x2 = a+w+d (the window's new end), both
+/// with n = |d|. d > 0 → (ICH, DCH); d < 0 → (DCH, ICH). Safe on any
+/// input: a → [0, cols−1], w → [1, cols−a], |d| → [1, (cols/4).max(2)]
+/// (a bigger shift is not "segmental"), x → [0, cols−1], n → [1, cols−x];
+/// d == 0 or a degenerate window (w ≤ 0, cols ≤ 0) → (None, None).
+/// Coordinate clamping at an edge is a degradation, not an error: "the
+/// tail is partially lost" is correct for a glitch.
+pub fn tear_cmds(a: i32, w: i32, d: i32, cols: i32) -> (Option<Cmd>, Option<Cmd>) {
+    if d == 0 || w <= 0 || cols <= 0 {
+        return (None, None);
+    }
+    let a = a.clamp(0, cols - 1);
+    let w = w.clamp(1, cols - a);
+    let n = d.abs().min((cols / 4).max(2)).max(1);
+    let d = if d > 0 { n } else { -n };
+    let x1 = a.min(a + d).clamp(0, cols - 1);
+    let x2 = (a + w + d).clamp(0, cols - 1);
+    let n1 = n.min(cols - x1).max(1);
+    let n2 = n.min(cols - x2).max(1);
+    if d > 0 {
+        (
+            Some(Cmd { x: x1, is_ich: true, n: n1 as u32 }),
+            Some(Cmd { x: x2, is_ich: false, n: n2 as u32 }),
+        )
+    } else {
+        (
+            Some(Cmd { x: x1, is_ich: false, n: n1 as u32 }),
+            Some(Cmd { x: x2, is_ich: true, n: n2 as u32 }),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +211,117 @@ mod tests {
         assert_eq!(shake_cmd(1, -1), Some((false, 2)));
         assert_eq!(shake_cmd(0, 0), None);
         assert_eq!(shake_cmd(3, 3), None);
+    }
+
+    // ── tear simulation: apply Cmd pairs to a Vec<char> as the terminal
+    // would (insert blanks at x, truncating at cols; delete n chars at x).
+
+    fn apply_cmd(row: &mut Vec<char>, cmd: &Cmd, cols: usize) {
+        let x = cmd.x as usize;
+        if cmd.is_ich {
+            for _ in 0..cmd.n {
+                row.insert(x, '·'); // the blank an ICH inserts, made visible
+            }
+            row.truncate(cols); // the terminal row is cols wide: pushed-out
+                                // cells are lost (accepted degradation, §3.4)
+        } else {
+            for _ in 0..cmd.n {
+                if x < row.len() {
+                    row.remove(x);
+                }
+            }
+        }
+    }
+
+    fn tear_row(a: i32, w: i32, d: i32, cols: usize, row: &str) -> String {
+        let (c1, c2) = tear_cmds(a, w, d, cols as i32);
+        let mut v: Vec<char> = row.chars().collect();
+        if let Some(c) = c1 {
+            apply_cmd(&mut v, &c, cols);
+        }
+        if let Some(c) = c2 {
+            apply_cmd(&mut v, &c, cols);
+        }
+        v.into_iter().collect()
+    }
+
+    #[test]
+    fn tear_cmds_right() {
+        // cols=12, window DEF ([3,6)), d=+2: ICH@3 2 then DCH@8 2.
+        let (c1, c2) = tear_cmds(3, 3, 2, 12);
+        let c1 = c1.expect("first cmd");
+        let c2 = c2.expect("second cmd");
+        assert!(c1.is_ich && c1.x == 3 && c1.n == 2);
+        assert!(!c2.is_ich && c2.x == 8 && c2.n == 2);
+        // Simulation: the window moves +2, the tail after the eaten zone is
+        // back in place (I,J at 8,9 as before), the 2 cells right after the
+        // window (G,H) are eaten; K,L fall off the right margin.
+        assert_eq!(tear_row(3, 3, 2, 12, "ABCDEFGHIJKL"), "ABC··DEFIJ");
+    }
+
+    #[test]
+    fn tear_cmds_left() {
+        // The spec's own example (§3.4): cols=10, window FG (a=5, w=2),
+        // d=−2: DCH@3 2 then ICH@5 2 → "ABCFG··HIJ".
+        let (c1, c2) = tear_cmds(5, 2, -2, 10);
+        let c1 = c1.expect("first cmd");
+        let c2 = c2.expect("second cmd");
+        assert!(!c1.is_ich && c1.x == 3 && c1.n == 2);
+        assert!(c2.is_ich && c2.x == 5 && c2.n == 2);
+        assert_eq!(tear_row(5, 2, -2, 10, "ABCDEFGHIJ"), "ABCFG··HIJ");
+        // Window moved −2 (F,G now at 3,4), tail H,I,J on place (7,8,9),
+        // D,E (the cells before the window) eaten.
+    }
+
+    #[test]
+    fn tear_cmds_clamps() {
+        // d = 0 or a degenerate window → no commands at all.
+        assert_eq!(tear_cmds(5, 2, 0, 10), (None, None));
+        assert_eq!(tear_cmds(5, 0, 2, 10), (None, None));
+        assert_eq!(tear_cmds(5, -3, 2, 10), (None, None));
+        // No panics and in-range results for wild inputs.
+        for (a, w, d, cols) in [
+            (-5, 2, 2, 10),
+            (100, 2, -2, 10),
+            (5, 100, 50, 10),
+            (5, 2, -50, 8),
+            (-20, 40, 30, 20),
+            (0, 1, 1, 8),
+            (7, 1, -1, 8),
+        ] {
+            let (c1, c2) = tear_cmds(a, w, d, cols);
+            for c in [c1, c2].into_iter().flatten() {
+                assert!((0..cols).contains(&c.x), "x={} out of [0,{cols}) for a={a} w={w} d={d}", c.x);
+                assert!(c.n >= 1, "n must be ≥ 1");
+                assert!(c.x + c.n as i32 <= cols, "x+n must stay inside the row");
+            }
+        }
+        // |d| clamps to (cols/4).max(2): cols=10 → 2, cols=80 → 20. The
+        // first input keeps x2 clear of the right edge: at the edge the
+        // n → [1, cols−x] clamp legally shrinks n (a=10 would clamp to 9,
+        // w=4 to 1, x2=12 to 9 → cols−x2=1 → n=1), and this assertion
+        // checks |d|, not the edge clamp.
+        let (_, c2) = tear_cmds(2, 4, 50, 10);
+        assert_eq!(c2.expect("second cmd").n, 2);
+        let (_, c2) = tear_cmds(10, 4, 50, 80);
+        assert_eq!(c2.expect("second cmd").n, 20);
+        // A tiny width clamps to [1, cols−a] without panicking.
+        let (c1, _) = tear_cmds(9, 1, 2, 10);
+        let c1 = c1.expect("first cmd");
+        assert_eq!((c1.x, c1.n), (9, 1));
+    }
+
+    #[test]
+    fn tear_cmds_order() {
+        // d>0: ICH@min(a, a+d) first, DCH@(a+w+d) second; d<0: DCH@min(a, a+d)
+        // first, ICH@(a+w+d) second (§3.4, the unified formula).
+        let (c1, c2) = tear_cmds(3, 3, 2, 20);
+        let (c1, c2) = (c1.unwrap(), c2.unwrap());
+        assert_eq!((c1.is_ich, c1.x), (true, 3));
+        assert_eq!((c2.is_ich, c2.x), (false, 8));
+        let (c1, c2) = tear_cmds(5, 2, -2, 10);
+        let (c1, c2) = (c1.unwrap(), c2.unwrap());
+        assert_eq!((c1.is_ich, c1.x), (false, 3));
+        assert_eq!((c2.is_ich, c2.x), (true, 5));
     }
 }
