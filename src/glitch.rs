@@ -19,6 +19,8 @@
 // the next frame's buffer — setting and resetting inside one write_all
 // never reaches the screen (spec §3.6).
 
+use crate::palettes::Palette;
+
 /// Glitch phases (spec §2). Order matters — monotonic in t.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
@@ -150,6 +152,66 @@ pub fn wave_row_bias(y: i32, rows: i32, direction: u8, front: f32) -> bool {
         2 => (fy - (frows - 1.0) / 2.0).abs() <= front, // center → out
         3 => fy.min(frows - 1.0 - fy) <= front,         // edges → center
         _ => frows - 1.0 - fy <= front,                 // 0 (default): bottom → up
+    }
+}
+
+// ── Noise glyphs + artifact colors (spec §3.5) ─────────────────────────
+
+/// Weighted noise glyph table (spec §3.5): '▓'×3, '▒'×3, '░'×2, '█'×2,
+/// '▄'×2, '▀'×2, '#'×1, '%'×1, '&'×1, '@'×1. Sum of weights = 18.
+const NOISE_TABLE: &[char] = &[
+    '▓', '▓', '▓',
+    '▒', '▒', '▒',
+    '░', '░',
+    '█', '█',
+    '▄', '▄',
+    '▀', '▀',
+    '#', '%', '&', '@',
+];
+pub const NOISE_TABLE_LEN: usize = NOISE_TABLE.len();
+
+/// Noise glyph by index into the weighted table (spec §4). Safe for any
+/// idx: taken modulo the length, so the inclusive Rng::range can never go
+/// out of bounds (same safety as debris_glyph in quake, disk_glyph in
+/// blackhole).
+pub fn noise_glyph(idx: usize) -> char {
+    NOISE_TABLE[idx % NOISE_TABLE_LEN]
+}
+
+/// The canonical glitch RGB set (spec §3.5) — an idiom no user palette
+/// derives; the same precedent as blackhole's black core and white flash
+/// (its spec §1 p.2–3). Pairing for twins: red↔cyan, magenta↔yellow,
+/// white→white.
+pub const GLITCH_RGB: [(u8, u8, u8); 5] = [
+    (255, 60, 60),   // red
+    (60, 255, 255),  // cyan
+    (255, 60, 255),  // magenta
+    (255, 255, 60),  // yellow
+    (255, 255, 255), // white
+];
+
+/// Artifact color (spec §4): rgb=false → a bright palette step, pick is
+/// clamped into 18..=36 (direct index, no soften — the palette is already
+/// softened in config::build_palette); rgb=true → GLITCH_RGB[pick mod 5]
+/// (rem_euclid, so negative picks are safe too).
+pub fn artifact_color(palette: &Palette, pick: i32, rgb: bool) -> (u8, u8, u8) {
+    if rgb {
+        GLITCH_RGB[pick.rem_euclid(5) as usize]
+    } else {
+        palette[pick.clamp(18, 36) as usize]
+    }
+}
+
+/// The RGB-twin color (spec §3.5): red↔cyan, magenta↔yellow, white→white.
+/// Anything else (a palette step — twins only spawn on RGB bands in run,
+/// so this arm is a safety net) degrades to white.
+pub fn twin_color(color: (u8, u8, u8)) -> (u8, u8, u8) {
+    match color {
+        c if c == GLITCH_RGB[0] => GLITCH_RGB[1],
+        c if c == GLITCH_RGB[1] => GLITCH_RGB[0],
+        c if c == GLITCH_RGB[2] => GLITCH_RGB[3],
+        c if c == GLITCH_RGB[3] => GLITCH_RGB[2],
+        _ => GLITCH_RGB[4],
     }
 }
 
@@ -404,5 +466,101 @@ mod tests {
         assert!(wave_row_bias(23, rows, 0, 0.0));
         assert!(!wave_row_bias(22, rows, 0, 0.0));
         assert!(!wave_row_bias(0, rows, 0, 0.0));
+    }
+
+    #[test]
+    fn noise_glyph_valid() {
+        let allowed = ['▓', '▒', '░', '█', '▄', '▀', '#', '%', '&', '@'];
+        // Every index in [0, LEN) maps into the allowed set.
+        for i in 0..NOISE_TABLE_LEN {
+            let ch = noise_glyph(i);
+            assert!(allowed.contains(&ch), "unexpected glyph {ch:?} at index {i}");
+        }
+        // Every glyph of the allowed set is present (weight ≥ 1); together
+        // with the loop above this also proves the table is non-empty.
+        for &ch in &allowed {
+            assert!(
+                (0..NOISE_TABLE_LEN).any(|i| noise_glyph(i) == ch),
+                "glyph {ch:?} missing from table"
+            );
+        }
+        // The weights of §3.5: ▓×3, ▒×3, ░×2, █×2, ▄×2, ▀×2, #×1, %×1, &×1, @×1.
+        for (ch, want) in [
+            ('▓', 3),
+            ('▒', 3),
+            ('░', 2),
+            ('█', 2),
+            ('▄', 2),
+            ('▀', 2),
+            ('#', 1),
+            ('%', 1),
+            ('&', 1),
+            ('@', 1),
+        ] {
+            let got = (0..NOISE_TABLE_LEN).filter(|&i| noise_glyph(i) == ch).count();
+            assert_eq!(got, want, "weight of {ch:?}: got {got}, want {want}");
+        }
+        // Out-of-range indices are safe — they wrap modulo the length
+        // (the inclusive Rng::range can return LEN itself).
+        for i in [NOISE_TABLE_LEN, NOISE_TABLE_LEN + 1, 1_000_000] {
+            assert!(allowed.contains(&noise_glyph(i)));
+        }
+    }
+
+    #[test]
+    fn noise_table_len_is_eighteen() {
+        // Sum of weights: 3+3+2+2+2+2+1+1+1+1 = 18 (§3.5).
+        assert_eq!(NOISE_TABLE_LEN, 18);
+    }
+
+    #[test]
+    fn artifact_color_palette() {
+        let mut pal = [(0u8, 0u8, 0u8); 37];
+        for (i, slot) in pal.iter_mut().enumerate() {
+            *slot = (i as u8, i as u8, i as u8); // the index is visible in the color
+        }
+        // rgb=false: idx clamps into the bright half 18..=36.
+        for pick in [-5, 0, 17, 37, 40, 99] {
+            let c = artifact_color(&pal, pick, false);
+            assert!(
+                (18..=36).contains(&(c.0 as i32)),
+                "pick={pick} escaped the bright half: color {c:?}"
+            );
+        }
+        // In-range picks take the palette step verbatim.
+        assert_eq!(artifact_color(&pal, 18, false), pal[18]);
+        assert_eq!(artifact_color(&pal, 36, false), pal[36]);
+        assert_eq!(artifact_color(&pal, 17, false), pal[18]);
+        assert_eq!(artifact_color(&pal, 37, false), pal[36]);
+    }
+
+    #[test]
+    fn artifact_color_rgb() {
+        // rgb=true: only GLITCH_RGB colors, any pick, by modulo (negative
+        // picks included — rem_euclid, not %).
+        for pick in -7..=17 {
+            let c = artifact_color(&pal37(), pick, true);
+            assert!(
+                GLITCH_RGB.contains(&c),
+                "pick={pick} produced a non-glitch color {c:?}"
+            );
+            assert_eq!(c, GLITCH_RGB[pick.rem_euclid(5) as usize]);
+        }
+    }
+
+    fn pal37() -> crate::palettes::Palette {
+        [(0u8, 0u8, 0u8); 37]
+    }
+
+    #[test]
+    fn twin_color_pairs() {
+        // red↔cyan, magenta↔yellow, white→white (§3.5); anything else (a
+        // palette step) degrades to white.
+        assert_eq!(twin_color(GLITCH_RGB[0]), GLITCH_RGB[1]);
+        assert_eq!(twin_color(GLITCH_RGB[1]), GLITCH_RGB[0]);
+        assert_eq!(twin_color(GLITCH_RGB[2]), GLITCH_RGB[3]);
+        assert_eq!(twin_color(GLITCH_RGB[3]), GLITCH_RGB[2]);
+        assert_eq!(twin_color(GLITCH_RGB[4]), GLITCH_RGB[4]);
+        assert_eq!(twin_color((10, 20, 30)), GLITCH_RGB[4]);
     }
 }
