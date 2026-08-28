@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`pyroclear` is a terminal `clear` replacement written in Rust. It animates a fire (or a UFO flyby) over the existing terminal content, then wipes the screen **and** scrollback (`\x1b[3J`). The final clear always runs, even on Ctrl-C.
+`pyroclear` is a terminal `clear` replacement written in Rust. It animates one of five effects over the existing terminal content — Doom fire (`fire`), a UFO laser sweep (`ufo`), a CRT power-off (`crt`), an earthquake (`quake`), or a black hole devouring the text (`blackhole`) — then wipes the screen **and** scrollback (`\x1b[3J`). The final clear always runs, even on Ctrl-C.
 
 ## The defining constraint: zero third-party crates
 
@@ -23,7 +23,7 @@ Do not add a crate dependency to solve something that is already done by hand he
 ```bash
 cargo build --release       # release build (opt-level 3 + LTO, see Cargo.toml)
 cargo run --release         # run it
-cargo test                  # unit tests (all live in src/ufo.rs)
+cargo test                  # unit tests (pure geometry/kinematics in src/ufo.rs, src/quake.rs, src/crt.rs, src/blackhole.rs)
 cargo test crater_is_roughly_circular_and_clipped   # single test by name
 cargo clippy --all-targets  # lint — the project keeps clippy clean (see git history)
 ```
@@ -42,7 +42,7 @@ Nix users: `flake.nix` / `package.nix` provide NixOS packaging.
 
 ## Architecture
 
-The module layout is documented in the header comment of `src/main.rs` — read it. Entry point is small: `resolve_choice()` → `build_palette()` → dispatch on `settings.effect` to `engine::burn` or `ufo::run` → unconditional final `\x1b[0m[H2J3J`.
+The module layout is documented in the header comment of `src/main.rs` — read it. Entry point is small: `resolve_choice()` → `build_palette()` → dispatch on `settings.effect` (`engine::burn` / `ufo::run` / `crt::run` / `quake::run` / `blackhole::run`) → unconditional final `\x1b[0m[H2J3J`.
 
 ### The fire effect (`engine.rs`) — Doom-fire algorithm
 
@@ -51,17 +51,17 @@ The module layout is documented in the header comment of `src/main.rs` — read 
 - Heat is mapped to color by indexing a `Palette = [(u8, u8, u8); 37]` directly: `palette[heat as usize]`.
 - The source row keeps reigniting until `elapsed > max_duration * flames_duration`, then cools; the loop also ends early once peak heat drops below `DIE_OUT_THRESHOLD`.
 
-### The "transparent overlay then erase" render model (shared by both effects)
+### The "transparent overlay then erase" render model (shared by all effects)
 
-This spans `engine.rs` and `ufo.rs` and is the key thing to understand:
+This spans all five effect modules and is the key thing to understand:
 
-1. A **`burned: Vec<bool>`** mask tracks every cell that has *ever* been touched by fire/laser/crater.
+1. A **`burned: Vec<bool>`** mask tracks every cell that has *ever* been touched by fire/laser/crater/debris.
 2. During animation, only burned/active cells are drawn — **untouched cells are skipped**, so the user's original terminal text shows through until the effect reaches it. This is also how the background stays transparent (cells are left alone rather than painted black; default-bg uses `\x1b[49m`).
-3. After the loop, a final pass (`clear_unburned` for fire; implicit for UFO) erases any cell the effect never reached, so nothing remains.
+3. After the loop, everything is erased: `clear_unburned` for fire; quake/blackhole mark all cells burned in their final phase; ufo/crt cover the screen by construction.
 
 ### Single-buffer rendering (no TUI framework)
 
-Both `engine::render` and `ufo::render` build the whole frame into one `String`, then do one `write_all` + `flush`. They batch ANSI state: a cursor move re-emits color, and color codes are only written when the color actually changes. Cursor is hidden (`\x1b[?25l`) on entry and **always** restored on exit (`\x1b[?25h`), including after Ctrl-C. This is why there is no flicker and no double-buffering crate.
+Every effect's render builds the whole frame into one `String`, then does one `write_all` + `flush`. They batch ANSI state: a cursor move re-emits color, and color codes are only written when the color actually changes. Cursor is hidden (`\x1b[?25l`) on entry and **always** restored on exit (`\x1b[?25h`), including after Ctrl-C. This is why there is no flicker and no double-buffering crate.
 
 ### Palettes (`palettes.rs`)
 
@@ -84,7 +84,15 @@ Config location: `$XDG_CONFIG_HOME/pyroclear/` (fallback `$HOME/.config/pyroclea
 
 ### The UFO effect (`ufo.rs`)
 
-Separate simulation sharing the same primitives (`terminal_size`, `Rng`, the burned-mask + cursor-home redraw model). A squadron of saucers enters from the right and sweeps left, firing Bresenham laser lines (`line_cells`) that leave aspect-compensated elliptical craters (`crater_cells`, with `rx = 2 * ry` to look circular on ~2:1 terminal cells) and expanding shockwave rings (`ring_cells`). The pure geometry functions are the **only unit-tested code** in the repo — add tests there when changing geometry.
+Separate simulation sharing the same primitives (`terminal_size`, `Rng`, the burned-mask + cursor-home redraw model). A squadron of saucers enters from the right and sweeps left, firing Bresenham laser lines (`line_cells`) that leave aspect-compensated elliptical craters (`crater_cells`, with `rx = 2 * ry` to look circular on ~2:1 terminal cells) and expanding shockwave rings (`ring_cells` — pub, reused by blackhole for its rim/flash ring). Pure geometry/kinematics functions are the unit-tested code across all effect modules — add tests there when changing them.
+
+### The quake effect (`quake.rs`)
+
+Earthquake over the user's **real** text: rows are shifted in place with ICH (`ESC[N@`) / DCH (`ESC[NP`) — the shake is honest, not drawn. A seismic wave spreads from a random epicenter (elliptic 2:1 distance), rows break as the wave reaches them, and detached cells crumble into gravity-driven debris particles colored by the palette. Model purity invariant: ICH/DCH only ever hits rows whose overlay is empty, so shift commands and drawn cells never conflict.
+
+### The black hole effect (`blackhole.rs`)
+
+A black hole opens at the screen center and devours the text: each Devouring row is pulled toward the center column by a paired `ICH@0 n_l` + `DCH@cx (n_l + n_r)` (both halves of the real text move; symbols vanish at the center). A row automaton governs it — Untouched → Devouring → Devoured: ICH/DCH go only to Devouring rows, the overlay draws only on Devoured rows. An accretion disk of polar-coordinate particles spins around the core (Keplerian angular speedup, spiral infall), the hole grows with consumed mass, then collapses and ends in a white flash. This is the only effect whose overlay uses background colors (black core, white flash): its private `Ov` copy carries `bg: Option<(u8, u8, u8)>`; all other modules' `Ov`/`render` are fg-only.
 
 ### Signals (`main.rs`)
 
