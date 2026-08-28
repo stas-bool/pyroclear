@@ -30,6 +30,7 @@ use std::time::Duration;
 
 pub const ESC: &str = "\x1b";
 
+pub mod blackhole;
 pub mod config;
 pub mod crt;
 pub mod display;
