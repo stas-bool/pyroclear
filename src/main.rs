@@ -17,6 +17,9 @@
 //   config    — AnimSettings, PaletteChoice, config I/O, CLI parsing
 //   display   — banner, help, info, start guide, color list
 //   engine    — PRNG, terminal size, fire simulation loop
+//   ufo       — UFO flyby effect (lasers, craters, shockwaves)
+//   crt       — CRT TV power-off effect
+//   quake     — earthquake effect (ICH/DCH shake, seismic wave, debris)
 //   tui       — raw terminal, key input, picker & settings TUIs
 //   win       — hand-rolled Win32 console bindings (Windows only)
 
@@ -32,6 +35,7 @@ pub mod crt;
 pub mod display;
 pub mod engine;
 pub mod palettes;
+pub mod quake;
 pub mod tui;
 pub mod ufo;
 #[cfg(windows)]
@@ -94,6 +98,7 @@ fn main() {
         config::Effect::Fire => burn(&palette, &settings, interrupted),
         config::Effect::Ufo => ufo::run(&settings, interrupted),
         config::Effect::Crt => crt::run(&palette, &settings, interrupted),
+        config::Effect::Quake => quake::run(&palette, &settings, interrupted),
     }
 
     // Final clear — always runs, even after SIGINT (cursor was restored in burn)
