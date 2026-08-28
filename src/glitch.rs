@@ -38,9 +38,7 @@ pub enum Phase {
 }
 
 /// Phase boundaries as half-open intervals [lo, hi) (spec §2). Cutoff
-/// includes t == 1.0. (NOISE_END = 0.92 — the noise→blank boundary INSIDE
-/// Cutoff, spec §3.8 — is introduced in the run-loop task, together with
-/// its first use.)
+/// includes t == 1.0.
 const PHASE_TREMOR_END: f32 = 0.15;
 const PHASE_TEARING_END: f32 = 0.50;
 const PHASE_CHAOS_END: f32 = 0.85;
