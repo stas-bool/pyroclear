@@ -17,6 +17,8 @@
 // overlay paints (model purity invariant, spec §3.2).
 
 use crate::palettes::Palette;
+use crate::ESC;
+use std::fmt::Write as _;
 
 /// Black hole phases (spec §2). Order matters — monotonic in t.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -221,6 +223,103 @@ pub fn step_particle(p: &mut Particle, dir: i32) {
 /// particle dove behind it and goes out.
 pub fn particle_dies(p: &Particle, hole_ry: f32) -> bool {
     p.radius <= hole_ry
+}
+
+// ── Overlay cell + grid primitives (as in ufo.rs, extended with bg) ────
+
+/// Ov carries a BACKGROUND color — the one extension of the shared base
+/// model (spec §3.2): the samples' render always resets ESC[49m, which
+/// makes the black core and the white flash undrawable. Ov/render are
+/// private in every module, so the neighbors are unaffected.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+struct Ov {
+    ch: char,
+    color: Option<(u8, u8, u8)>, // fg; None ⇒ default fg (the erase space)
+    bg: Option<(u8, u8, u8)>, // bg; None ⇒ default bg; Some — core/flash only
+}
+
+/// Place an overlay cell into the grid at the given coordinates, bounds-checked.
+#[allow(dead_code)]
+fn stamp(grid: &mut [Option<Ov>], cols: i32, rows: i32, x: i32, y: i32, ov: Ov) {
+    if (0..cols).contains(&x) && (0..rows).contains(&y) {
+        grid[(y as usize) * (cols as usize) + (x as usize)] = Some(ov);
+    }
+}
+
+/// Mark a cell as touched by the effect, bounds-checked (as burn() in ufo.rs).
+#[allow(dead_code)]
+fn burn(burned: &mut [bool], cols: i32, rows: i32, x: i32, y: i32) {
+    if (0..cols).contains(&x) && (0..rows).contains(&y) {
+        burned[(y as usize) * (cols as usize) + (x as usize)] = true;
+    }
+}
+
+/// Render the overlay grid into a String (as in ufo.rs, BUT the buffer is
+/// NOT cleared here: a blackhole frame starts with the ICH/DCH pull prefix
+/// that run() writes into the same buf before calling render — one String,
+/// one write_all per frame, spec §3.2). fg and bg are batched independently:
+/// each is emitted only on change and always re-emitted after a cursor
+/// move. None cells are skipped so the original terminal text shows through
+/// until the effect reaches it.
+#[allow(dead_code)]
+fn render(buf: &mut String, grid: &[Option<Ov>], cols: usize, rows: usize) {
+    let mut last_color: Option<Option<(u8, u8, u8)>> = None;
+    let mut last_bg: Option<Option<(u8, u8, u8)>> = None;
+    let mut need_move = true;
+    let mut wcol = 0usize;
+    let mut wrow = 0usize;
+
+    for y in 0..rows {
+        for x in 0..cols {
+            let Some(ov) = grid[y * cols + x] else {
+                need_move = true;
+                continue;
+            };
+            if need_move || wrow != y || wcol != x {
+                let _ = write!(buf, "{ESC}[{};{}H", y + 1, x + 1);
+                last_color = None; // colors must be re-emitted after a cursor move
+                last_bg = None;
+                need_move = false;
+                wrow = y;
+                wcol = x;
+            }
+            if last_color != Some(ov.color) {
+                match ov.color {
+                    Some((r, g, b)) => {
+                        let _ = write!(buf, "{ESC}[38;2;{r};{g};{b}m");
+                    }
+                    None => {
+                        let _ = write!(buf, "{ESC}[39m");
+                    }
+                }
+                last_color = Some(ov.color);
+            }
+            if last_bg != Some(ov.bg) {
+                match ov.bg {
+                    Some((r, g, b)) => {
+                        let _ = write!(buf, "{ESC}[48;2;{r};{g};{b}m");
+                    }
+                    None => {
+                        let _ = write!(buf, "{ESC}[49m");
+                    }
+                }
+                last_bg = Some(ov.bg);
+            }
+            buf.push(ov.ch);
+            wcol += 1;
+        }
+    }
+    let _ = write!(buf, "{ESC}[0m");
+}
+
+/// Linear interpolation between two RGB colors — the rim → white ramp of
+/// the Collapse and the flash ramp (spec §3.4/§3.5); `t` is clamped to [0,1].
+#[allow(dead_code)]
+fn lerp_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
+    let t = t.clamp(0.0, 1.0);
+    let ch = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    (ch(a.0, b.0), ch(a.1, b.1), ch(a.2, b.2))
 }
 
 #[cfg(test)]
