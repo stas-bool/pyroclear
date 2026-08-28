@@ -19,9 +19,14 @@
 // the next frame's buffer — setting and resetting inside one write_all
 // never reaches the screen (spec §3.6).
 
+use crate::engine::{terminal_size, Rng};
 use crate::palettes::Palette;
-use crate::ESC;
+use crate::{config::AnimSettings, ESC};
 use std::fmt::Write as _;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Glitch phases (spec §2). Order matters — monotonic in t.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -39,6 +44,8 @@ pub enum Phase {
 const PHASE_TREMOR_END: f32 = 0.15;
 const PHASE_TEARING_END: f32 = 0.50;
 const PHASE_CHAOS_END: f32 = 0.85;
+/// The noise→blank boundary INSIDE Cutoff (spec §3.8).
+const NOISE_END: f32 = 0.92;
 // PHASE_CUTOFF_END = 1.0 (implicit).
 
 /// Phase by normalized time (0..=1). Boundary convention: [lo, hi);
@@ -246,14 +253,12 @@ pub fn band_rect(
 // ── Overlay cell + grid primitives (as in ufo.rs/quake.rs, fg-only) ────
 
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // constructed only in run() — the allow is dropped in Task 8
 struct Ov {
     ch: char,
     color: Option<(u8, u8, u8)>, // None ⇒ default fg/bg (the erase space)
 }
 
 /// Place an overlay cell into the grid at the given coordinates, bounds-checked.
-#[allow(dead_code)]
 fn stamp(grid: &mut [Option<Ov>], cols: i32, rows: i32, x: i32, y: i32, ov: Ov) {
     if (0..cols).contains(&x) && (0..rows).contains(&y) {
         grid[(y as usize) * (cols as usize) + (x as usize)] = Some(ov);
@@ -261,7 +266,6 @@ fn stamp(grid: &mut [Option<Ov>], cols: i32, rows: i32, x: i32, y: i32, ov: Ov) 
 }
 
 /// Mark a cell as touched by the effect, bounds-checked (as burn() in ufo.rs).
-#[allow(dead_code)]
 fn burn(burned: &mut [bool], cols: i32, rows: i32, x: i32, y: i32) {
     if (0..cols).contains(&x) && (0..rows).contains(&y) {
         burned[(y as usize) * (cols as usize) + (x as usize)] = true;
@@ -274,7 +278,6 @@ fn burn(burned: &mut [bool], cols: i32, rows: i32, x: i32, y: i32) {
 /// calling render — one String, one write_all per frame, spec §3.2).
 /// None cells are skipped so the original terminal text shows through
 /// until the effect reaches it.
-#[allow(dead_code)]
 fn render(buf: &mut String, grid: &[Option<Ov>], cols: usize, rows: usize) {
     let mut last_color: Option<Option<(u8, u8, u8)>> = None;
     let mut need_move = true;
@@ -310,6 +313,459 @@ fn render(buf: &mut String, grid: &[Option<Ov>], cols: usize, rows: usize) {
         }
     }
     let _ = write!(buf, "{ESC}[0m");
+}
+
+// ── Main-loop tuning constants (spec §3.10) ────────────────────────────
+
+const SHAKE_HOLD: u32 = 3; // frames between jolt retargets (as quake, §3.3)
+const JOLT_MIN: i32 = 1; // jolt burst length, frames (JOLT_FRAMES = 1..=3, §3.3)
+const JOLT_MAX: i32 = 3;
+const P_TWIN: f32 = 0.3; // twin chance on an RGB band in Chaos (§3.5)
+const P_INVERT: f32 = 0.04; // random inversion chance per Chaos frame (§3.6)
+const MAX_INVERTS: u32 = 3; // random inversion flashes per run (§3.6)
+const BAND_LIFE_MIN: i32 = 4; // band lifetime, frames (§3.5)
+const BAND_LIFE_MAX: i32 = 8;
+const SILENCE_BREAK: u32 = 2; // quiet Cutoff frames before the early exit (§3.8)
+
+/// Random float in [0, 1) on top of the integer PRNG (there is no rand crate).
+fn rand_f01(rng: &mut Rng) -> f32 {
+    (rng.next_u64() % 1_000_000) as f32 / 1_000_000.0
+}
+
+/// Per-row jolt retarget counters, randomized so the rows jolt out of sync
+/// (as quake's fresh_hold_phases, spec §3.2 of quake).
+fn fresh_hold_phases(rows: usize, rng: &mut Rng) -> Vec<u32> {
+    (0..rows)
+        .map(|_| rng.range(0, SHAKE_HOLD as i32 - 1) as u32)
+        .collect()
+}
+
+/// Per-phase jolt probability at retarget (spec §3.3): Tremor 0.06,
+/// Tearing 0.25, Chaos 0.45; Cutoff never jolts (all rows are Torn /
+/// the cleanup runs).
+fn p_jolt(phase: Phase) -> f32 {
+    match phase {
+        Phase::Tremor => 0.06,
+        Phase::Tearing => 0.25,
+        Phase::Chaos => 0.45,
+        Phase::Cutoff => 0.0,
+    }
+}
+
+/// Sign of a tear shift with the wind bias (spec §3.7): wind ≠ 0 → toward
+/// wind with p = 0.5 + 0.1·|wind|, else against; wind = 0 → 50/50.
+fn tear_sign(wind: i32, rng: &mut Rng) -> i32 {
+    let r = rand_f01(rng);
+    let s = wind.signum();
+    if s == 0 {
+        if r < 0.5 { -1 } else { 1 }
+    } else if r < 0.5 + 0.1 * wind.abs() as f32 {
+        s
+    } else {
+        -s
+    }
+}
+
+/// One noise band (spec §3.5). `rows` is the clamped row range; `twin` is
+/// the RGB-twin horizontal offset (±1..=2; only an RGB band in Chaos can
+/// carry one — chromatic aberration over a palette step is meaningless).
+struct Band {
+    x: i32,
+    w: i32,
+    rows: std::ops::Range<usize>,
+    life: u8, // frames until degradation into emptiness
+    color: (u8, u8, u8),
+    twin: Option<i32>,
+}
+
+/// Spawn one band (spec §3.5). The row: half the spawns along the damage
+/// front, half uniform over the screen (spec §3.7 — damage everywhere,
+/// with a direction). The covered rows turn Torn right now — their
+/// accumulated shift is compensated to 0 with a single ICH/DCH (spec
+/// §3.2), from here the row lives in the overlay's clean coordinates.
+#[allow(clippy::too_many_arguments)]
+fn spawn_band(
+    buf: &mut String,
+    bands: &mut Vec<Band>,
+    rng: &mut Rng,
+    palette: &Palette,
+    cols: i32,
+    rows: i32,
+    row_torn: &mut [bool],
+    row_off: &mut [i32],
+    burned: &mut [bool],
+    direction: u8,
+    front: f32,
+    chaos: bool,
+) {
+    // Width: 10-45% of the row; the lower bound never drops below 1 (on
+    // narrow terminals cols/10 = 0 — and Rng::range needs lo ≤ hi, §3.4).
+    let w = rng.range((cols / 10).max(1), 9 * cols / 20);
+    let x = rng.range(0, cols - w);
+    let h = rng.range(1, 2); // 1-2 rows, inclusive range
+    let y = if rand_f01(rng) < 0.5 {
+        let on_front: Vec<i32> = (0..rows)
+            .filter(|&y| !row_torn[y as usize] && wave_row_bias(y, rows, direction, front))
+            .collect();
+        if on_front.is_empty() {
+            rng.range(0, rows - 1)
+        } else {
+            on_front[rng.range(0, on_front.len() as i32 - 1) as usize]
+        }
+    } else {
+        rng.range(0, rows - 1)
+    };
+    let Some((bx, by, bw, bh)) = band_rect(x, w, y, h, cols, rows) else {
+        return; // degenerate or fully off-screen — the spawn is skipped (§3.5)
+    };
+    // The touched rows leave the Intact world NOW (spec §3.2): compensate
+    // the accumulated shift to 0 with a single ICH/DCH, as quake's break.
+    for yy in by..by + bh {
+        if !row_torn[yy] {
+            if let Some((is_ich, n)) = shake_cmd(row_off[yy], 0) {
+                if is_ich {
+                    let _ = write!(buf, "{ESC}[{};1H{ESC}[{n}@", yy + 1);
+                } else {
+                    let _ = write!(buf, "{ESC}[{};1H{ESC}[{n}P", yy + 1);
+                }
+            }
+            row_off[yy] = 0;
+            row_torn[yy] = true;
+        }
+    }
+    // Burn the band's cells (a partial band leaves the untouched text of
+    // the row visible until Cutoff, spec §3.2).
+    for yy in by..by + bh {
+        for xx in bx..bx + bw {
+            burned[yy * cols as usize + xx] = true;
+        }
+    }
+    // Color (spec §3.5): 50/50 a bright palette step or a canonical glitch
+    // RGB; only an RGB band can carry a twin (Chaos, p ≈ 0.3).
+    let rgb_band = rand_f01(rng) < 0.5;
+    let color = artifact_color(palette, rng.range(18, 36), rgb_band);
+    let twin = if chaos && rgb_band && rand_f01(rng) < P_TWIN {
+        let sign = if rand_f01(rng) < 0.5 { -1 } else { 1 };
+        Some(sign * rng.range(1, 2))
+    } else {
+        None
+    };
+    bands.push(Band {
+        x: bx as i32,
+        w: bw as i32,
+        rows: by..by + bh,
+        life: rng.range(BAND_LIFE_MIN, BAND_LIFE_MAX) as u8,
+        color,
+        twin,
+    });
+}
+
+// ── Main loop ──────────────────────────────────────────────────────────
+
+pub fn run(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicBool>) {
+    let (mut cols, mut rows) = terminal_size();
+    // Too small to bother — main() does the final clear anyway (spec §7).
+    if cols < 8 || rows < 4 {
+        return;
+    }
+    let fps = settings.fps.max(1) as u64;
+    let frame_delay = Duration::from_millis(1000 / fps);
+    // Clamp the duration from below to 0.8 s (spec §2) — Tremor needs a
+    // frame budget for its rare jolts (quake clamps at 0.6, blackhole at 1.0).
+    let t = Duration::from_secs_f32(settings.duration.max(0.8));
+
+    let mut rng = Rng::new();
+    let mut burned = vec![false; cols * rows];
+    let mut grid: Vec<Option<Ov>> = vec![None; cols * rows];
+    let mut row_off = vec![0i32; rows]; // accumulated jolt shift, columns
+    let mut row_target = vec![0i32; rows];
+    let mut row_hold = fresh_hold_phases(rows, &mut rng);
+    let mut row_jolt_left = vec![0u32; rows]; // frames until auto-return
+    let mut row_torn = vec![false; rows]; // the Intact/Torn automaton (§3.2)
+    let mut row_op = vec![false; rows]; // one jolt OR tear per row per frame (§3.2)
+    let mut bands: Vec<Band> = Vec::new();
+    let mut band_timer: i32 = 0; // frames until the next band spawn
+    let mut inverted = false; // the screen is inverted right now (§3.6)
+    let mut inverts_left: u32 = MAX_INVERTS;
+    let mut chaos_seen = false; // the guaranteed junction flash fired (§3.6)
+    let mut silence: u32 = 0; // quiet Cutoff frames — the early exit (§3.8)
+    let mut buf = String::with_capacity(cols * rows * 6);
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let _ = write!(out, "{ESC}[?25l"); // hide cursor
+    let _ = out.flush();
+
+    let start = Instant::now();
+    loop {
+        if interrupted.load(Ordering::Relaxed) {
+            break;
+        }
+        let elapsed = start.elapsed();
+        if elapsed > t {
+            break;
+        }
+
+        // Live resize (spec §7): the state is recreated, `t` is NOT reset.
+        let (nc, nr) = terminal_size();
+        if nc != cols || nr != rows {
+            cols = nc;
+            rows = nr;
+            if cols < 8 || rows < 4 {
+                break;
+            }
+            burned = vec![false; cols * rows];
+            grid = vec![None; cols * rows];
+            row_off = vec![0; rows];
+            row_target = vec![0; rows];
+            row_hold = fresh_hold_phases(rows, &mut rng);
+            row_jolt_left = vec![0; rows];
+            row_torn = vec![false; rows];
+            row_op = vec![false; rows];
+            bands.clear();
+            silence = 0; // the blank Cutoff re-runs over the new geometry
+            buf.reserve(cols * rows * 6);
+        }
+        let (ci, ri) = (cols as i32, rows as i32);
+
+        // Reset the overlay and the per-frame op marks.
+        for cell in grid.iter_mut() {
+            *cell = None;
+        }
+        for op in row_op.iter_mut() {
+            *op = false;
+        }
+
+        let t01 = (elapsed.as_secs_f32() / t.as_secs_f32()).clamp(0.0, 1.0);
+        let phase = phase_at(t01);
+        let cutoff = t01 >= PHASE_CHAOS_END;
+        // The damage front over Tearing+Chaos (spec §3.7).
+        let p_tc = ((t01 - PHASE_TREMOR_END) / (PHASE_CHAOS_END - PHASE_TREMOR_END))
+            .clamp(0.0, 1.0);
+        let front = damage_front(p_tc, ri);
+
+        buf.clear();
+
+        // (0) Screen inversion (spec §3.6). Reset FIRST — the previous
+        // frame's flash dies before any drawing. A new flash never rides
+        // the same buffer as a reset (?5l + ?5h in one write_all would
+        // cancel before reaching the screen): the junction flash cannot
+        // collide (random flashes only exist after chaos_seen), and a
+        // random one is barred while the previous frame flashed.
+        let was_inverted = inverted;
+        if inverted {
+            let _ = write!(buf, "{ESC}[?5l");
+            inverted = false;
+        }
+        if phase == Phase::Chaos {
+            if !chaos_seen {
+                chaos_seen = true;
+                let _ = write!(buf, "{ESC}[?5h"); // the junction flash
+                inverted = true;
+            } else if !was_inverted && inverts_left > 0 && rand_f01(&mut rng) < P_INVERT {
+                inverts_left -= 1;
+                let _ = write!(buf, "{ESC}[?5h");
+                inverted = true;
+            }
+        }
+
+        // (1) Bands (spec §3.5): age and reap FIRST, then spawn by phase —
+        // a band spawned in this frame must not age in it: life N means N
+        // visible frames (§3.5); with aging after the spawn it would be
+        // N−1. New bands mark their rows Torn (compensating the shifts —
+        // inside spawn_band).
+        for b in bands.iter_mut() {
+            b.life = b.life.saturating_sub(1);
+        }
+        bands.retain(|b| b.life > 0);
+        if matches!(phase, Phase::Tearing | Phase::Chaos) {
+            if band_timer <= 0 {
+                band_timer = if phase == Phase::Tearing {
+                    rng.range(3, 5) // 1 band every 3-5 frames
+                } else {
+                    rng.range(2, 3) // 1-2 bands every 2-3 frames
+                };
+                let count = if phase == Phase::Tearing { 1 } else { rng.range(1, 2) };
+                for _ in 0..count {
+                    spawn_band(
+                        &mut buf,
+                        &mut bands,
+                        &mut rng,
+                        palette,
+                        ci,
+                        ri,
+                        &mut row_torn,
+                        &mut row_off,
+                        &mut burned,
+                        settings.direction,
+                        front,
+                        phase == Phase::Chaos,
+                    );
+                }
+            }
+            band_timer -= 1;
+        }
+
+        // (2) Jolts (spec §3.3): retarget once per SHAKE_HOLD frames; a
+        // burst is target = ±amp for 1-3 frames, then an automatic return
+        // to 0 — a fleeting glitch, not a continuous quake shake. Intact
+        // rows only; a row that emits a command is marked for §3.2 (no
+        // tear on top of it this frame).
+        if !cutoff {
+            let a = amp(t01, settings.height);
+            let pj = p_jolt(phase);
+            for y in 0..ri {
+                let yi = y as usize;
+                if row_torn[yi] {
+                    continue;
+                }
+                // Age the running burst BEFORE the retarget: a burst born
+                // in this frame must not age in its spawn frame — with
+                // aging after, N = 1 returns the target to 0 before a
+                // single command is emitted (shake_cmd(0, 0) = None) and
+                // the visible burst is 0..=2 frames instead of the spec's
+                // 1..=3 (§3.3).
+                if row_jolt_left[yi] > 0 {
+                    row_jolt_left[yi] -= 1;
+                    if row_jolt_left[yi] == 0 {
+                        row_target[yi] = 0; // the burst is over — return
+                    }
+                }
+                row_hold[yi] += 1;
+                if row_hold[yi] >= SHAKE_HOLD {
+                    row_hold[yi] = 0;
+                    if a > 0 && rand_f01(&mut rng) < pj {
+                        let sign = if rand_f01(&mut rng) < 0.5 { -1 } else { 1 };
+                        row_target[yi] = sign * rng.range(1, a);
+                        row_jolt_left[yi] = rng.range(JOLT_MIN, JOLT_MAX) as u32;
+                    } else {
+                        row_target[yi] = 0;
+                    }
+                }
+                if let Some((is_ich, n)) = shake_cmd(row_off[yi], row_target[yi]) {
+                    if is_ich {
+                        let _ = write!(buf, "{ESC}[{};1H{ESC}[{n}@", y + 1);
+                    } else {
+                        let _ = write!(buf, "{ESC}[{};1H{ESC}[{n}P", y + 1);
+                    }
+                    row_op[yi] = true;
+                }
+                row_off[yi] = row_target[yi];
+            }
+        }
+
+        // (3) Tears (spec §3.4): K random Intact rows that did NOT just
+        // get a jolt this frame (one shift op per row per frame, §3.2).
+        let k = match phase {
+            Phase::Tearing => rng.range(0, 1), // 0..=1 — rare
+            Phase::Chaos => rng.range(2, 4),   // 2..=4
+            _ => 0,
+        };
+        if k > 0 {
+            let mut cands: Vec<usize> = (0..rows)
+                .filter(|&y| !row_torn[y] && !row_op[y])
+                .collect();
+            // min(6, cols/3) keeps lo ≤ hi on the narrow terminals the
+            // §7 guard allows (an empty Rng::range span would panic).
+            let w_lo = (ci / 3).min(6);
+            for _ in 0..k {
+                // Check BEFORE drawing (R2): Rng::range(0, −1) is a % 0
+                // panic — a .get() guard runs only AFTER range has already
+                // panicked. An empty list is the norm in late Chaos (every
+                // row already Torn), not an edge case.
+                if cands.is_empty() {
+                    break;
+                }
+                let pick = cands[rng.range(0, cands.len() as i32 - 1) as usize];
+                cands.retain(|&c| c != pick);
+                let w = rng.range(w_lo, ci / 3);
+                let a = rng.range(0, ci - w);
+                let mag = rng.range(1, 2 + 2 * settings.height.clamp(0, 3));
+                let d = tear_sign(settings.wind, &mut rng) * mag;
+                let (c1, c2) = tear_cmds(a, w, d, ci);
+                for c in [c1, c2].into_iter().flatten() {
+                    let op = if c.is_ich { '@' } else { 'P' };
+                    let _ = write!(buf, "{ESC}[{};{}H{ESC}[{}{op}", pick + 1, c.x + 1, c.n);
+                }
+                row_op[pick] = true;
+            }
+        }
+
+        // (4) Overlay (spec §3.2). From Cutoff on, the WHOLE screen is
+        // force-burned with no regard for row states (a late resize in
+        // Cutoff must not leave the cleanup dirty — as Settle in quake).
+        if cutoff {
+            for cell in burned.iter_mut() {
+                *cell = true;
+            }
+        }
+        for y in 0..ri {
+            for x in 0..ci {
+                if burned[y as usize * cols + x as usize] {
+                    stamp(&mut grid, ci, ri, x, y, Ov { ch: ' ', color: None });
+                }
+            }
+        }
+        // Live bands: fresh random noise every frame (spec §3.5); the twin
+        // is the same rectangle shifted, in the paired RGB color. stamp
+        // and burn are bounds-checked, so a twin hanging over the edge is
+        // simply trimmed. Skipped in Cutoff — the noise below covers all.
+        if !cutoff {
+            for b in bands.iter() {
+                let (y0, y1) = (b.rows.start as i32, b.rows.end as i32);
+                for y in y0..y1 {
+                    for x in b.x..b.x + b.w {
+                        let ch = noise_glyph(rng.range(0, NOISE_TABLE_LEN as i32 - 1) as usize);
+                        burn(&mut burned, ci, ri, x, y);
+                        stamp(&mut grid, ci, ri, x, y, Ov { ch, color: Some(b.color) });
+                    }
+                }
+                if let Some(off) = b.twin {
+                    for y in y0..y1 {
+                        for x in (b.x + off)..(b.x + off + b.w) {
+                            let ch = noise_glyph(rng.range(0, NOISE_TABLE_LEN as i32 - 1) as usize);
+                            burn(&mut burned, ci, ri, x, y);
+                            stamp(&mut grid, ci, ri, x, y, Ov { ch, color: Some(twin_color(b.color)) });
+                        }
+                    }
+                }
+            }
+        }
+        // The Cutoff signal cut (spec §3.8): the whole screen is noise
+        // until NOISE_END, then blank quiet frames (the erase layer above
+        // already blanked everything burned).
+        if cutoff && t01 < NOISE_END {
+            for y in 0..ri {
+                for x in 0..ci {
+                    let ch = noise_glyph(rng.range(0, NOISE_TABLE_LEN as i32 - 1) as usize);
+                    // 70/30 palette bright half / glitch RGB (§3.8).
+                    let color =
+                        artifact_color(palette, rng.range(18, 36), rand_f01(&mut rng) < 0.3);
+                    stamp(&mut grid, ci, ri, x, y, Ov { ch, color: Some(color) });
+                }
+            }
+        }
+
+        render(&mut buf, &grid, cols, rows);
+        let _ = out.write_all(buf.as_bytes());
+        let _ = out.flush();
+
+        // Early exit (spec §3.8): two quiet frames in a row — the screen
+        // is already blank, further frames are pixel-identical.
+        if cutoff && t01 >= NOISE_END {
+            silence += 1;
+            if silence >= SILENCE_BREAK {
+                break;
+            }
+        }
+        std::thread::sleep(frame_delay);
+    }
+
+    // Always restore the cursor AND reset the screen inversion — main()'s
+    // final ESC[0m only resets SGR attributes and does not touch DECSCNM
+    // (spec §3.6/§7); the ?5l here covers a Ctrl-C mid-flash too.
+    let _ = write!(out, "{ESC}[?25h{ESC}[?5l");
+    let _ = out.flush();
 }
 
 #[cfg(test)]
