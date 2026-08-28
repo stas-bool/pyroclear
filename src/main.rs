@@ -36,6 +36,7 @@ pub mod config;
 pub mod crt;
 pub mod display;
 pub mod engine;
+pub mod glitch;
 pub mod palettes;
 pub mod quake;
 pub mod tui;
