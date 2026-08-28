@@ -21,6 +21,7 @@
 //   crt       — CRT TV power-off effect
 //   quake     — earthquake effect (ICH/DCH shake, seismic wave, debris)
 //   blackhole — black hole effect (ICH/DCH text pull, accretion disk, flash)
+//   glitch    — digital glitch effect (ICH/DCH jolts and tears, noise bands, DECSCNM flashes)
 //   tui       — raw terminal, key input, picker & settings TUIs
 //   win       — hand-rolled Win32 console bindings (Windows only)
 

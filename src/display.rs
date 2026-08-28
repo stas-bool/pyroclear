@@ -136,7 +136,7 @@ pub fn print_help() {
         ("--custom", "Interactive custom palette manager (TUI)"),
         ("--random, -r", "Random palette — different every run"),
         ("--reset", "Reset to default (fire), then burn"),
-        ("--effect <name>, -e", "Animation: 'fire' (default), 'ufo', 'crt', 'quake', 'blackhole' or 'random'"),
+        ("--effect <name>, -e", "Animation: 'fire' (default), 'ufo', 'crt', 'quake', 'blackhole', 'glitch' or 'random'"),
     ];
     for (flag, desc) in modes {
         println!(
@@ -171,6 +171,7 @@ pub fn print_help() {
         ("pyroclear --effect crt", "CRT TV power-off wipe"),
         ("pyroclear --effect quake", "seismic shake crumbles the screen"),
         ("pyroclear --effect blackhole", "black hole devours the screen"),
+        ("pyroclear --effect glitch", "digital glitch tears the screen apart"),
         ("pyroclear --effect random", "random effect each run"),
         ("pyroclear", "burn with saved / default palette"),
         ("pyroclear --color ocean", "burn ocean & save it"),
