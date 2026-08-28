@@ -215,6 +215,32 @@ pub fn twin_color(color: (u8, u8, u8)) -> (u8, u8, u8) {
     }
 }
 
+/// Clamp a band rectangle into the screen (spec §4): returns
+/// (x0, y0, w_eff, h_eff). Fully outside the screen or degenerate
+/// (w ≤ 0, h ≤ 0, cols ≤ 0, rows ≤ 0) → None — the spawn is then skipped
+/// (spec §3.5). Positive sizes that only partially hang over an edge are
+/// trimmed to the visible part.
+pub fn band_rect(
+    x: i32,
+    w: i32,
+    y: i32,
+    h: i32,
+    cols: i32,
+    rows: i32,
+) -> Option<(usize, usize, usize, usize)> {
+    if w <= 0 || h <= 0 || cols <= 0 || rows <= 0 {
+        return None;
+    }
+    let x0 = x.max(0);
+    let y0 = y.max(0);
+    let x1 = (x + w).min(cols); // exclusive end
+    let y1 = (y + h).min(rows);
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    Some((x0 as usize, y0 as usize, (x1 - x0) as usize, (y1 - y0) as usize))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,5 +588,27 @@ mod tests {
         assert_eq!(twin_color(GLITCH_RGB[3]), GLITCH_RGB[2]);
         assert_eq!(twin_color(GLITCH_RGB[4]), GLITCH_RGB[4]);
         assert_eq!(twin_color((10, 20, 30)), GLITCH_RGB[4]);
+    }
+
+    #[test]
+    fn band_rect_fits() {
+        // Fits — as given.
+        assert_eq!(band_rect(2, 5, 3, 2, 20, 10), Some((2, 3, 5, 2)));
+        // Sticks out right → trimmed; sticks out bottom → trimmed.
+        assert_eq!(band_rect(15, 10, 3, 2, 20, 10), Some((15, 3, 5, 2)));
+        assert_eq!(band_rect(2, 5, 8, 4, 20, 10), Some((2, 8, 5, 2)));
+        // Sticks out left/top → the visible part.
+        assert_eq!(band_rect(-3, 5, -1, 3, 20, 10), Some((0, 0, 2, 2)));
+        // Fully outside → None.
+        assert_eq!(band_rect(25, 4, 3, 2, 20, 10), None);
+        assert_eq!(band_rect(-10, 5, 3, 2, 20, 10), None);
+        assert_eq!(band_rect(2, 5, 12, 2, 20, 10), None);
+        assert_eq!(band_rect(2, 5, -5, 3, 20, 10), None);
+        // Degenerate w/h → None (the band does not spawn — the contract
+        // fixed by the spec review, point 5).
+        assert_eq!(band_rect(2, 0, 3, 2, 20, 10), None);
+        assert_eq!(band_rect(2, -4, 3, 2, 20, 10), None);
+        assert_eq!(band_rect(2, 5, 3, 0, 20, 10), None);
+        assert_eq!(band_rect(2, 5, 3, -1, 20, 10), None);
     }
 }
