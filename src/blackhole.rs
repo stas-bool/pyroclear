@@ -104,9 +104,12 @@ pub fn devour_rate(dy: i32, front: f32, cols: usize, dy_max: i32, frames_left: u
 /// The pull command pair for a Devouring row (spec §3.2/§4):
 /// (n_ich@0, n_dch@cx). n_ich = min(rate, left) — the left cells that have
 /// reached cx; n_dch = n_l + n_r — everything eaten at cx this frame.
+/// left/right are the row's live-cell counters — non-negative by
+/// construction (each is only ever decremented by its own min-clamped n),
+/// so the plain cast is exact and needs no clamping.
 pub fn devour_cmds(left: i32, right: i32, rate: u32) -> (u32, u32) {
-    let nl = (rate as i32).min(left).max(0) as u32;
-    let nr = (rate as i32).min(right).max(0) as u32;
+    let nl = rate.min(left as u32);
+    let nr = rate.min(right as u32);
     (nl, nl + nr)
 }
 
@@ -118,10 +121,14 @@ const MASS_FRACTION: f32 = 0.65;
 
 /// The hole's vertical semi-radius by normalized time and devoured mass
 /// (spec §3.3); the horizontal radius is ×2 (2:1 cell aspect, as the ufo
-/// craters). Emergence: linear 1 → 2. Attraction: min(k·eaten, cap) — the
-/// devoured mass grows the hole; cap = max(rows/(7 − height), 2) (bigger
-/// with height, floored for mini terminals). Collapse: quadratic ease-in
-/// cap → 1. Flash: linear 1 → 0. Monotone within each phase.
+/// craters). Emergence: linear 1 → 2. Attraction: max(min(k·eaten, cap), 2)
+/// — the devoured mass grows the hole, floored at the Emergence end level
+/// so it never deflates at the phase boundary (eaten may still be small
+/// there on a short duration or a big screen); cap = max(rows/(7 − height),
+/// 2) (bigger with height, floored for mini terminals — the floor also
+/// guarantees 2 ≤ cap, so the Attraction floor never pushes past cap).
+/// Collapse: quadratic ease-in cap → 1. Flash: linear 1 → 0. Monotone
+/// within each phase.
 pub fn hole_ry(t01: f32, eaten: u32, cols: usize, rows: usize, height: i32) -> f32 {
     let t = t01.clamp(0.0, 1.0);
     let cap = ((rows as i32) / (7 - height.clamp(0, 3))).max(2) as f32;
@@ -129,7 +136,11 @@ pub fn hole_ry(t01: f32, eaten: u32, cols: usize, rows: usize, height: i32) -> f
         1.0 + t / PHASE_EMERGE_END
     } else if t < PHASE_ATTRACT_END {
         let k = cap / (MASS_FRACTION * (cols * rows) as f32);
-        (k * eaten as f32).min(cap)
+        // Floored at the Emergence end level: a hole that has just opened
+        // must not visibly deflate on the first Attraction frame while the
+        // mass is still catching up (2 ≤ cap by the floor above, so this
+        // stays within cap).
+        (k * eaten as f32).min(cap).max(2.0)
     } else if t < PHASE_COLLAPSE_END {
         let p = (t - PHASE_ATTRACT_END) / (PHASE_COLLAPSE_END - PHASE_ATTRACT_END);
         cap + (1.0 - cap) * p * p
@@ -484,7 +495,9 @@ pub fn run(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicBo
         // same value gates both activation and devour_rate (review point 3).
         let front_eff = pull_front(p_attr, (dy_max + 1) as f32).max(START_R as f32);
         // Frame budget until the end of Attraction (spec §3.3). Clamped ≥ 1:
-        // a row activated at the phase boundary or after a late resize must
+        // a row activated at the phase boundary, after a late resize, or in
+        // a frame that a lagging terminal made late (t01 follows the wall
+        // clock, so the phases fast-forward while frames are dropped) must
         // finish in one frame, not divide by zero (§7).
         let frames_left =
             (((PHASE_ATTRACT_END - t01) * t.as_secs_f32() * fps as f32).ceil() as u32).max(1);
@@ -558,17 +571,26 @@ pub fn run(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicBo
         // rim's inner edge — the dying particle is respawned in place just
         // outside the horizon with a SPARKLE_FRAMES lease (age set near
         // MAX_AGE, so the age check reaps it right after); an age death
-        // simply drops out, no dot. The color needs no fixup: the radius
-        // mapping above already yields the brightest step (idx 36) at the
-        // horizon. Mechanism fixed by the plan — spec §3.4 mentions the dot
-        // in prose only (§4/§5/§8 define nothing), see risk R8.
+        // simply drops out, no dot. The lease marker IS the age: a dot is a
+        // particle at age ≥ MAX_AGE − SPARKLE_FRAMES, and one re-caught by
+        // the still-growing horizon dies plainly — exactly one short flash
+        // per dive, no re-lease (the growing hole would otherwise keep
+        // re-arming the dot and the "short" sparkle would live the whole
+        // growth as a stationary bright rim). The color needs no fixup: the
+        // radius mapping above already yields the brightest step (idx 36) at
+        // the horizon. Mechanism fixed by the plan — spec §3.4 mentions the
+        // dot in prose only (§4/§5/§8 define nothing), see risk R8.
         let mut i = 0;
         while i < particles.len() {
             if particle_dies(&particles[i], ry) {
-                let mut dot = particles.remove(i);
-                dot.radius = ry + SPARKLE_DRIFT;
-                dot.age = MAX_AGE - SPARKLE_FRAMES; // short lease, reaped by age
-                particles.push(dot);
+                if particles[i].age >= MAX_AGE - SPARKLE_FRAMES {
+                    particles.remove(i); // a re-caught dot: one lease per dive
+                } else {
+                    let mut dot = particles.remove(i);
+                    dot.radius = ry + SPARKLE_DRIFT;
+                    dot.age = MAX_AGE - SPARKLE_FRAMES; // short lease, reaped by age
+                    particles.push(dot);
+                }
             } else if particles[i].age > MAX_AGE {
                 particles.remove(i);
             } else {
@@ -600,15 +622,20 @@ pub fn run(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicBo
         // ufo::ring_cells with r = hole_ry; the core stamped after it covers
         // the inner ~2/3 of the band (its normalized-distance window is
         // 0.6..=1.2), so the visible rim is thin, along the outer edge.
-        // The color runs from palette[36] to white over Collapse.
-        let rim_color = lerp_rgb(palette[36], WHITE, p_collapse);
-        let rim_r = ry.round().max(1.0) as i32;
-        for &(x, y) in &ring_cells(cx, cy, rim_r, ci, ri) {
-            if row_state[y] != RowState::Devoured {
-                continue; // on other rows the void at cx plays the hole (§3.2)
+        // The color runs from palette[36] to white over Collapse. No rim in
+        // Flash (spec §2): the collapsed point shows only the white core
+        // and the expanding ring — a stationary white band hanging around
+        // it for the rest of the effect is not part of the image.
+        if !flash {
+            let rim_color = lerp_rgb(palette[36], WHITE, p_collapse);
+            let rim_r = ry.round().max(1.0) as i32;
+            for &(x, y) in &ring_cells(cx, cy, rim_r, ci, ri) {
+                if row_state[y] != RowState::Devoured {
+                    continue; // on other rows the void at cx plays the hole (§3.2)
+                }
+                burn(&mut burned, ci, ri, x as i32, y as i32);
+                stamp(&mut grid, ci, ri, x as i32, y as i32, Ov { ch: ' ', color: None, bg: Some(rim_color) });
             }
-            burn(&mut burned, ci, ri, x as i32, y as i32);
-            stamp(&mut grid, ci, ri, x as i32, y as i32, Ov { ch: ' ', color: None, bg: Some(rim_color) });
         }
         // The black core (spec §3.2): an explicit black background over the
         // erase layer — without it the hole is invisible on a light terminal
