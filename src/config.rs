@@ -18,6 +18,7 @@ pub enum Effect {
     Ufo,
     Crt,
     Quake,
+    Blackhole,
 }
 
 
@@ -28,6 +29,7 @@ impl Effect {
             "ufo" => Some(Effect::Ufo),
             "crt" => Some(Effect::Crt),
             "quake" => Some(Effect::Quake),
+            "blackhole" => Some(Effect::Blackhole),
             _ => None,
         }
     }
@@ -38,6 +40,7 @@ impl Effect {
             Effect::Ufo => "ufo",
             Effect::Crt => "crt",
             Effect::Quake => "quake",
+            Effect::Blackhole => "blackhole",
         }
     }
 }
@@ -365,19 +368,20 @@ pub fn random_palette_choice() -> PaletteChoice {
     PaletteChoice::Named(id.to_string())
 }
 
-/// A uniformly random effect (fire / ufo / crt / quake). Used by `--effect random`,
-/// mirroring `random_palette_choice` for palettes.
+/// A uniformly random effect (fire / ufo / crt / quake / blackhole). Used by
+/// `--effect random`, mirroring `random_palette_choice` for palettes.
 pub fn random_effect() -> Effect {
     use crate::engine::Rng;
     let mut rng = Rng::new();
-    // Rng::range is inclusive → range(0, 3) yields 0, 1, 2 or 3 — exactly the
-    // four outcomes. NOT range(0, 4): that would give 5 outcomes and skew
-    // towards Quake (spec §6.2).
-    match rng.range(0, 3) {
+    // Rng::range is inclusive → range(0, 4) yields 0, 1, 2, 3 or 4 — exactly
+    // the five outcomes. NOT range(0, 5): that would give 6 outcomes and skew
+    // towards Blackhole (spec §6.2).
+    match rng.range(0, 4) {
         0 => Effect::Fire,
         1 => Effect::Ufo,
         2 => Effect::Crt,
-        _ => Effect::Quake,
+        3 => Effect::Quake,
+        _ => Effect::Blackhole,
     }
 }
 
@@ -480,7 +484,7 @@ fn parse_args(saved_settings: &AnimSettings) -> (
                                 None => {
                                     eprintln!(
                                         "{ESC}[1;38;2;255;70;70m✗ error:{ESC}[0m Unknown effect '{name}'\n\
-                                         {ESC}[38;2;95;95;115m  tip: effects are 'fire', 'ufo', 'crt', 'quake' or 'random'{ESC}[0m"
+                                         {ESC}[38;2;95;95;115m  tip: effects are 'fire', 'ufo', 'crt', 'quake', 'blackhole' or 'random'{ESC}[0m"
                                     );
                                     std::process::exit(1);
                                 }
