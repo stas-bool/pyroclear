@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`pyroclear` is a terminal `clear` replacement written in Rust. It animates one of five effects over the existing terminal content — Doom fire (`fire`), a UFO laser sweep (`ufo`), a CRT power-off (`crt`), an earthquake (`quake`), or a black hole devouring the text (`blackhole`) — then wipes the screen **and** scrollback (`\x1b[3J`). The final clear always runs, even on Ctrl-C.
+`pyroclear` is a terminal `clear` replacement written in Rust. It animates one of six effects over the existing terminal content — Doom fire (`fire`), a UFO laser sweep (`ufo`), a CRT power-off (`crt`), an earthquake (`quake`), a black hole devouring the text (`blackhole`), or a digital glitch tearing the screen apart (`glitch`) — then wipes the screen **and** scrollback (`\x1b[3J`). The final clear always runs, even on Ctrl-C.
 
 ## The defining constraint: zero third-party crates
 
@@ -42,7 +42,7 @@ Nix users: `flake.nix` / `package.nix` provide NixOS packaging.
 
 ## Architecture
 
-The module layout is documented in the header comment of `src/main.rs` — read it. Entry point is small: `resolve_choice()` → `build_palette()` → dispatch on `settings.effect` (`engine::burn` / `ufo::run` / `crt::run` / `quake::run` / `blackhole::run`) → unconditional final `\x1b[0m[H2J3J`.
+The module layout is documented in the header comment of `src/main.rs` — read it. Entry point is small: `resolve_choice()` → `build_palette()` → dispatch on `settings.effect` (`engine::burn` / `ufo::run` / `crt::run` / `quake::run` / `blackhole::run` / `glitch::run`) → unconditional final `\x1b[0m[H2J3J`.
 
 ### The fire effect (`engine.rs`) — Doom-fire algorithm
 
@@ -53,7 +53,7 @@ The module layout is documented in the header comment of `src/main.rs` — read 
 
 ### The "transparent overlay then erase" render model (shared by all effects)
 
-This spans all five effect modules and is the key thing to understand:
+This spans all six effect modules and is the key thing to understand:
 
 1. A **`burned: Vec<bool>`** mask tracks every cell that has *ever* been touched by fire/laser/crater/debris.
 2. During animation, only burned/active cells are drawn — **untouched cells are skipped**, so the user's original terminal text shows through until the effect reaches it. This is also how the background stays transparent (cells are left alone rather than painted black; default-bg uses `\x1b[49m`).
@@ -93,6 +93,10 @@ Earthquake over the user's **real** text: rows are shifted in place with ICH (`E
 ### The black hole effect (`blackhole.rs`)
 
 A black hole opens at the screen center and devours the text: each Devouring row is pulled toward the center column by a paired `ICH@0 n_l` + `DCH@cx (n_l + n_r)` (both halves of the real text move; symbols vanish at the center). A row automaton governs it — Untouched → Devouring → Devoured: ICH/DCH go only to Devouring rows, the overlay draws only on Devoured rows. An accretion disk of polar-coordinate particles spins around the core (Keplerian angular speedup, spiral infall), the hole grows with consumed mass, then collapses and ends in a white flash. This is the only effect whose overlay uses background colors (black core, white flash): its private `Ov` copy carries `bg: Option<(u8, u8, u8)>`; all other modules' `Ov`/`render` are fg-only.
+
+### The glitch effect (`glitch.rs`)
+
+A digital signal failure over the user's **real** text. Two honest shift kinds: **jolt** — a 1–3-frame ICH/DCH burst on a whole row with an automatic return (quake's shake logic, but intermittent), and **tear** — the window `[a, a+w)` of a row shifted by an ICH/DCH pair (`|d|` cells in the direction of travel are lost, the rest of the row stays). Noise bands (`▓▒░` + ASCII) burn their cells and move their rows to **Torn** — the row automaton: ICH/DCH go only to Intact rows, the overlay draws only on Torn ones; a freshly-Torn row's accumulated shift is compensated to 0 first. Colors: half from the bright palette half (18..=36), half from the canonical `GLITCH_RGB` set (red/cyan/magenta/yellow/white). Inversion flashes are the real DECSCNM screen mode: `?5h` heads the flash frame's buffer, `?5l` is the first bytes of the next frame (both in one `write_all` would never reach the screen); the unconditional `?5l` in the exit path covers Ctrl-C mid-flash. Ends with full-screen noise, blank quiet frames, and the standard final clear.
 
 ### Signals (`main.rs`)
 
