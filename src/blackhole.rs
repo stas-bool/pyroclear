@@ -187,6 +187,42 @@ pub fn orbit_pos(cx: i32, cy: i32, angle: f32, radius: f32) -> (f32, f32) {
     )
 }
 
+// ── Particles: the accretion disk (spec §3.4) ─────────────────────────
+
+/// Disk tuning (spec §3.7) — starting values, tuned by eye.
+const INFALL: f32 = 0.03; // radial drift toward the hole, cells/frame
+const K_KEPLER: f32 = 1.0; // Keplerian spin-up factor
+
+/// One disk particle (spec §3.4): polar mechanics on a 2:1 ellipse — an
+/// orbit, not quake's ballistic debris. `age` is incremented in run(), the
+/// MAX_AGE comparison lives there too (as in quake).
+pub struct Particle {
+    angle: f32,  // θ on the 2:1 ellipse
+    radius: f32, // current orbit radius (in "round" units — the ry)
+    speed: f32,  // base angular velocity
+    ch: char,
+    color: (u8, u8, u8),
+    age: u32, // frames alive; death by MAX_AGE — a run() check
+}
+
+/// One frame of orbital mechanics (spec §3.4): the Keplerian spin-up — the
+/// angular velocity grows toward the center, factor (1 + K/radius) — plus
+/// the infall drift. Physics only; death is decided by particle_dies in run().
+pub fn step_particle(p: &mut Particle, dir: i32) {
+    // The max() guards the division: a particle may still orbit a hole that
+    // has already collapsed (Flash shrinks hole_ry to 0) — the next death
+    // pass in run() reaps it; meanwhile the step must not produce inf/NaN.
+    let kepler = 1.0 + K_KEPLER / p.radius.max(0.001);
+    p.angle += dir as f32 * p.speed * kepler;
+    p.radius -= INFALL;
+}
+
+/// Particle death by the horizon (spec §3.4): radius ≤ hole_ry — the
+/// particle dove behind it and goes out.
+pub fn particle_dies(p: &Particle, hole_ry: f32) -> bool {
+    p.radius <= hole_ry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,5 +523,44 @@ mod tests {
         assert_eq!(disk_color(&pal, 36), pal[36]);
         assert_eq!(disk_color(&pal, 8), pal[9]);
         assert_eq!(disk_color(&pal, 37), pal[36]);
+    }
+
+    #[test]
+    fn particle_spirals_in() {
+        let mk = || Particle {
+            angle: 0.5,
+            radius: 8.0,
+            speed: 0.1,
+            ch: '·',
+            color: (0, 0, 0),
+            age: 0,
+        };
+        let mut p = mk();
+        let (a0, r0) = (p.angle, p.radius);
+        step_particle(&mut p, 1);
+        assert!(p.radius < r0, "infall must shrink the radius");
+        assert!(p.angle > a0, "dir=+1 must advance the angle");
+        // dir = −1 flips the sign of the angular increment (spec §8).
+        let mut q = mk();
+        step_particle(&mut q, -1);
+        assert!(q.angle < a0, "dir=−1 must retard the angle");
+        assert!(q.radius < r0);
+    }
+
+    #[test]
+    fn particle_dies_at_horizon() {
+        let p = Particle {
+            angle: 0.0,
+            radius: 3.0,
+            speed: 0.1,
+            ch: '·',
+            color: (0, 0, 0),
+            age: 0,
+        };
+        // On the horizon (radius == hole_ry) → dives; the hole grew past the
+        // orbit → dives. Still outside → alive.
+        assert!(particle_dies(&p, 3.0));
+        assert!(particle_dies(&p, 5.0));
+        assert!(!particle_dies(&p, 2.9));
     }
 }
