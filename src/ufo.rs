@@ -42,23 +42,29 @@ fn char_color(ch: char) -> Option<(u8, u8, u8)> {
 const C_LASER: (u8, u8, u8) = (0x39, 0xff, 0x14); // neon green beam
 /// Blast color ramp: white-hot core fading through yellow/orange to a dim
 /// ember. Indexed by shot age so the impact visibly cools as it expands.
-const C_BLAST: [(u8, u8, u8); 6] = [
+const C_BLAST: [(u8, u8, u8); 8] = [
     (0xff, 0xff, 0xff), // 0 — white-hot core
     (0xff, 0xf2, 0x99), // 1 — pale yellow
     (0xff, 0xd6, 0x44), // 2 — yellow
     (0xff, 0x9b, 0x22), // 3 — orange
     (0xff, 0x55, 0x22), // 4 — red-orange
     (0xb0, 0x2a, 0x20), // 5 — dark ember
+    (0x8a, 0x22, 0x1a), // 6 — deep ember
+    (0x5a, 0x17, 0x11), // 7 — dying ash
 ];
-/// Crater half-height in rows (diameter ≈ 5). Width radius is doubled to
+/// Crater half-height in rows (diameter ≈ 7). Width radius is doubled to
 /// compensate the terminal cell aspect ratio (~2:1 tall) so the blast reads
 /// as a circle rather than a narrow vertical streak.
-const CRATER_RY: i32 = 2;
+const CRATER_RY: i32 = 3;
 const CRATER_RX: i32 = CRATER_RY * 2;
+/// Max radius (in rows) the expanding shockwave ring reaches; it grows one
+/// row per frame up to this cap. Must stay below `SHOT_LIFE` so the ring
+/// can reach it before the shot dies.
+const RING_MAX_R: i32 = 6;
 /// Frames a shot stays alive: the beam fires for two frames, then the
 /// expanding shockwave + fading ember play out so the impact is obvious
 /// rather than a one-cell flicker.
-const SHOT_LIFE: u32 = 6;
+const SHOT_LIFE: u32 = 8;
 
 // ── Pure geometry (unit-tested) ───────────────────────────────────────
 
@@ -371,7 +377,7 @@ pub fn run(settings: &AnimSettings, interrupted: Arc<AtomicBool>) {
                 stamp(&mut grid, ci, ri, sh.cx, sh.cy, Ov { ch: '✦', color: Some(blast) });
             }
             // Expanding shockwave ring: grows each frame, dims as it goes.
-            let ring_r = ((sh.age as i32) + 1).min(4);
+            let ring_r = ((sh.age as i32) + 1).min(RING_MAX_R);
             let ring_ch = if sh.age < 2 {
                 '▓'
             } else if sh.age < 4 {
@@ -530,5 +536,14 @@ mod tests {
             assert!(x < 80 && y < 24);
         }
         assert!(!cells.contains(&(0, 0)));
+    }
+
+    #[test]
+    fn blast_constants_are_consistent() {
+        // One blast color per shot frame: age indexes C_BLAST directly.
+        assert_eq!(C_BLAST.len(), SHOT_LIFE as usize);
+        // The ring must be able to reach its cap before the shot dies:
+        // ring_r = min(age + 1, RING_MAX_R) peaks at age RING_MAX_R - 1.
+        assert!(RING_MAX_R < SHOT_LIFE as i32);
     }
 }
