@@ -1,5 +1,6 @@
-{ lib
-, rustPlatform
+{
+  lib,
+  rustPlatform,
 }:
 
 rustPlatform.buildRustPackage {
@@ -13,6 +14,6 @@ rustPlatform.buildRustPackage {
   meta = {
     description = "Pyroclear";
     license = lib.licenses.mit;
-    platforms = lib.platforms.linux;
+    platforms = lib.platforms.linux ++ lib.platforms.darwin;
   };
 }
