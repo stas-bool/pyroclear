@@ -46,7 +46,7 @@ The module layout is documented in the header comment of `src/main.rs` — read 
 
 ### The fire effect (`engine.rs`) — Doom-fire algorithm
 
-- A 2D **heat grid** of `u8`, values `0..=36` (`MAX_HEAT = 36`). One row (bottom by default, top if `direction = true`) is the ignition source set to `MAX_HEAT`.
+- A 2D **heat grid** of `u8`, values `0..=36` (`MAX_HEAT = 36`). One row/column is the ignition source set to `MAX_HEAT` — bottom by default (`direction`: 0 bottom→top, 1 top→bottom, 2 left→right, 3 right→left, 4 **two-sided** bottom+top). Direction 4 stays two-sided only while `rows > fire_reach(height)` (`normalize_direction`, tested) — i.e. when the fire cannot reach the top on its own — and otherwise degrades to plain bottom-up; the grid splits into two `zone_bounds(rows)` halves, each running its one-directional physics toward the middle.
 - Each frame runs `STEPS_PER_FRAME = 2` propagation steps: every cell pulls its new value from the neighbor below (above, if top-down), minus a random **decay** (scaled by `height`) and a random horizontal **drift** (scaled by `wind`, range `-2..=2`). Heat propagates away from the source and cools.
 - Heat is mapped to color by indexing a `Palette = [(u8, u8, u8); 37]` directly: `palette[heat as usize]`.
 - The source row keeps reigniting until `elapsed > max_duration * flames_duration`, then cools; the loop also ends early once peak heat drops below `DIE_OUT_THRESHOLD`.

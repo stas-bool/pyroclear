@@ -113,7 +113,7 @@ pyroclear [OPTIONS]
 | :--- | :--- | :--- |
 | **`--start`** | Open the onboarding presentation & guide | `pyroclear --start` |
 | **`--effect <name>`** | Run a specific effect: `fire`, `ufo`, `crt`, `quake`, `blackhole`, `glitch`, or `random` (saves as default) | `pyroclear --effect blackhole` |
-| **`--settings`, `-s`** | Adjust FPS, wind direction, animation durations, and flame height decay | `pyroclear --settings` |
+| **`--settings`, `-s`** | Adjust FPS, wind direction, fire direction (incl. two-sided on tall terminals), animation durations, and flame height decay | `pyroclear --settings` |
 | **`--pick`, `-p`** | Interactive color palette picker with live swatches | `pyroclear --pick` |
 | **`--custom`** | TUI to save, name, manage and run custom gradients | `pyroclear --custom` |
 | **`--color <name>`** | Burn with a specific named palette (saves as default) | `pyroclear --color toxic` |

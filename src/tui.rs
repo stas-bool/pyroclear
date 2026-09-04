@@ -2,7 +2,7 @@
 
 use crate::{
     config::{AnimSettings, PaletteChoice},
-    engine::{terminal_size, Rng},
+    engine::{terminal_size, zone_bounds, Rng},
     palettes::*,
     ESC,
 };
@@ -340,6 +340,63 @@ impl PreviewFire {
                             let ny = (y as i32 + drift).clamp(0, self.rows as i32 - 1) as usize;
                             let new_val = (right as i32 - decay).max(0) as u8;
                             self.grid[ny * self.cols + (x - 1)] = new_val;
+                        }
+                    }
+                }
+                4 => {
+                    // Bottom + Top: seed both source rows, zones meet in the middle.
+                    // The preview shows the two-sided physics regardless of its own
+                    // (small) height — the tall-terminal activation rule only
+                    // applies to the real burn.
+                    for x in 0..self.cols {
+                        self.grid[x] = 36;
+                        self.grid[(self.rows - 1) * self.cols + x] = 36;
+                    }
+                    let (top_end, bottom_start) = zone_bounds(self.rows);
+                    for x in 0..self.cols {
+                        for y in 0..top_end {
+                            let above = self.grid[y * self.cols + x];
+                            let decay = match settings.height {
+                                0 => rng.range(1, 4),
+                                1 => rng.range(0, 3),
+                                2 => rng.range(0, 2),
+                                3 => rng.range(0, 1),
+                                _ => rng.range(0, 3),
+                            };
+                            let drift = match settings.wind {
+                                -2 => rng.range(-2, 0),
+                                -1 => rng.range(-1, 0),
+                                0  => rng.range(-1, 1),
+                                1  => rng.range(0, 1),
+                                2  => rng.range(0, 2),
+                                _  => rng.range(-1, 1),
+                            };
+                            let nx = (x as i32 + drift).clamp(0, self.cols as i32 - 1) as usize;
+                            let new_val = (above as i32 - decay).max(0) as u8;
+                            self.grid[(y + 1) * self.cols + nx] = new_val;
+                        }
+                    }
+                    for x in 0..self.cols {
+                        for y in bottom_start..self.rows {
+                            let below = self.grid[y * self.cols + x];
+                            let decay = match settings.height {
+                                0 => rng.range(1, 4),
+                                1 => rng.range(0, 3),
+                                2 => rng.range(0, 2),
+                                3 => rng.range(0, 1),
+                                _ => rng.range(0, 3),
+                            };
+                            let drift = match settings.wind {
+                                -2 => rng.range(-2, 0),
+                                -1 => rng.range(-1, 0),
+                                0  => rng.range(-1, 1),
+                                1  => rng.range(0, 1),
+                                2  => rng.range(0, 2),
+                                _  => rng.range(-1, 1),
+                            };
+                            let nx = (x as i32 + drift).clamp(0, self.cols as i32 - 1) as usize;
+                            let new_val = (below as i32 - decay).max(0) as u8;
+                            self.grid[(y - 1) * self.cols + nx] = new_val;
                         }
                     }
                 }
@@ -786,7 +843,7 @@ pub fn run_dashboard(
                                 settings.height = if settings.height > 0 { settings.height - 1 } else { 3 };
                             }
                             3 => {
-                                settings.direction = settings.direction.wrapping_add(3) % 4;
+                                settings.direction = settings.direction.wrapping_add(4) % 5;
                             }
                             4 => {
                                 if let Some(idx) = duration_options.iter().position(|&x| x == settings.flames_duration) {
@@ -816,7 +873,7 @@ pub fn run_dashboard(
                                 settings.height = if settings.height < 3 { settings.height + 1 } else { 0 };
                             }
                             3 => {
-                                settings.direction = (settings.direction + 1) % 4;
+                                settings.direction = (settings.direction + 1) % 5;
                             }
                             4 => {
                                 if let Some(idx) = duration_options.iter().position(|&x| x == settings.flames_duration) {
@@ -1107,6 +1164,7 @@ pub fn run_dashboard(
                             1 => "Top → Bottom",
                             2 => "Left → Right",
                             3 => "Right → Left",
+                            4 => "Bottom + Top (tall)",
                             _ => "Bottom → Top",
                         },
                         selected_setting_idx == 3,

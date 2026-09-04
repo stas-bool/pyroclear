@@ -34,7 +34,7 @@ If you use `to`, you need to also use `from` and you can't use `pallete`
 | `fps` | integer | `60` |
 | `wind` | integer | `0` |
 | `height` | integer | `1` |
-| `direction` | boolean | `false` |
+| `direction` | integer | `0` |
 | `duration` | float | `1.0` |
 | `flames_duration` |  float | `0.7` |
 
@@ -48,8 +48,8 @@ Can be any integer from -2 to 2.
 The height of the fire.
 Can be any integer from 0 to 3.
 ### `direction`
-The direction of the fire, `false` means from bottom to top, `true` is from top to bottom.
-Can be either `true` or `false`.
+The direction of the fire: `0` bottom → top (default), `1` top → bottom, `2` left → right, `3` right → left, `4` bottom + top (both edges burn; only active when the fire cannot reach the far edge at the current `height` — otherwise it behaves like `0`).
+Can be any integer from 0 to 4.
 ### `duration`
 The duration of the animation.
 Can be any positive decimal.
@@ -68,7 +68,7 @@ to = "#00ff00"
 fps              = 60
 wind             = 0
 height           = 1
-direction        = false
+direction        = 0
 duration         = 1
 flames_duration  = 0.7
 ```

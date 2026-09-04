@@ -53,7 +53,7 @@ pub struct AnimSettings {
     pub fps: u32,
     pub wind: i32,       // -2..=2 (Strong Left → Strong Right); 0 = None
     pub height: i32,     // 0 = Low, 1 = Medium, 2 = High, 3 = Extreme
-    pub direction: u8,   // 0 = Bottom→Top (default), 1 = Top→Bottom, 2 = Left→Right, 3 = Right→Left
+    pub direction: u8,   // 0 = Bottom→Top (default), 1 = Top→Bottom, 2 = Left→Right, 3 = Right→Left, 4 = Bottom+Top (tall terminals only)
     pub duration: f32,   // 1 = 1 seconds, 1.2 = 1.2 seconds .. 5 = 5 seconds
     pub flames_duration: f32,   // 0 = stops instantly, 1 = stops at the end of the animation
     pub effect: Effect,
@@ -185,7 +185,7 @@ pub fn load_config() -> (Option<PaletteChoice>, AnimSettings) {
                 }
                 "direction" => {
                     if let Ok(n) = val.parse::<u8>() {
-                        settings.direction = n.clamp(0, 3);
+                        settings.direction = n.clamp(0, 4);
                     }
                 }
                 "duration" =>  {
@@ -243,7 +243,7 @@ pub fn save_config(choice: &PaletteChoice, settings: &AnimSettings) {
     content.push_str(&format!("fps              = {}\n", settings.fps));
     content.push_str(&format!("wind             = {}\n", settings.wind));
     content.push_str(&format!("height           = {}\n", settings.height));
-    content.push_str(&format!("direction        = {}\n", settings.direction)); // 0=Bottom→Top 1=Top→Bottom 2=Left→Right 3=Right→Left
+    content.push_str(&format!("direction        = {}\n", settings.direction)); // 0=Bottom→Top 1=Top→Bottom 2=Left→Right 3=Right→Left 4=Bottom+Top
     content.push_str(&format!("duration         = {}\n", settings.duration));
     content.push_str(&format!("flames_duration  = {}\n", settings.flames_duration));
     content.push_str(&format!("effect           = {}\n", settings.effect.id()));

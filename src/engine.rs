@@ -188,6 +188,13 @@ fn resize_grid(cols: usize, rows: usize, direction: u8) -> Vec<u8> {
                 grid[y * cols + (cols - 1)] = MAX_HEAT;
             }
         }
+        4 => {
+            // Bottom + Top: seed both source rows
+            for x in 0..cols {
+                grid[x] = MAX_HEAT;
+                grid[(rows - 1) * cols + x] = MAX_HEAT;
+            }
+        }
         _ => {
             // Bottom → Top (default): seed bottom row
             for x in 0..cols {
@@ -219,7 +226,8 @@ pub fn burn(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicB
     let source_cool_at = max_duration.mul_f32(settings.flames_duration);
     let mut frame = String::with_capacity(cols * rows * 8);
     let frame_delay = Duration::from_millis(1000 / settings.fps.max(1) as u64);
-    let direction = settings.direction;
+    // direction 4 (two-sided) survives only when the fire cannot reach the top.
+    let mut direction = normalize_direction(settings.direction, rows, settings.height);
 
     loop {
         if interrupted.load(Ordering::Relaxed) {
@@ -236,6 +244,7 @@ pub fn burn(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicB
         if new_cols != cols || new_rows != rows {
             cols = new_cols;
             rows = new_rows;
+            direction = normalize_direction(settings.direction, rows, settings.height);
             grid = resize_grid(cols, rows, direction);
             burned = vec![false; cols * rows];
             frame.reserve(cols * rows * 8);
@@ -252,6 +261,12 @@ pub fn burn(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicB
                 }
                 3 => {
                     for y in 0..rows { grid[y * cols + (cols - 1)] = MAX_HEAT; }
+                }
+                4 => {
+                    for x in 0..cols {
+                        grid[x] = MAX_HEAT;
+                        grid[(rows - 1) * cols + x] = MAX_HEAT;
+                    }
                 }
                 _ => {
                     for x in 0..cols { grid[(rows - 1) * cols + x] = MAX_HEAT; }
@@ -360,6 +375,69 @@ pub fn burn(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicB
                         }
                     }
                 }
+                4 => {
+                    // Bottom + Top: two half-grid zones meet in the middle.
+                    // The top zone copies downward physics, the bottom zone upward
+                    // physics; zone_bounds guarantees they never write the same row.
+                    let (top_end, bottom_start) = zone_bounds(rows);
+                    // Top half: row y radiates into row y+1
+                    for x in 0..cols {
+                        for y in 0..top_end {
+                            let above = grid[y * cols + x];
+                            let decay = match settings.height {
+                                0 => rng.range(1, 4),
+                                1 => rng.range(0, 3),
+                                2 => rng.range(0, 2),
+                                3 => rng.range(0, 1),
+                                _ => rng.range(0, 3),
+                            };
+                            let drift = match settings.wind {
+                                -2 => rng.range(-2, 0),
+                                -1 => rng.range(-1, 0),
+                                0  => rng.range(-1, 1),
+                                1  => rng.range(0, 1),
+                                2  => rng.range(0, 2),
+                                _  => rng.range(-1, 1),
+                            };
+                            let nx = (x as i32 + drift).clamp(0, cols as i32 - 1) as usize;
+                            let new_val = (above as i32 - decay).max(0) as u8;
+                            grid[(y + 1) * cols + nx] = new_val;
+                        }
+                    }
+                    // Bottom half: row y radiates into row y-1
+                    for x in 0..cols {
+                        for y in bottom_start..rows {
+                            let below = grid[y * cols + x];
+                            let decay = match settings.height {
+                                0 => rng.range(1, 4),
+                                1 => rng.range(0, 3),
+                                2 => rng.range(0, 2),
+                                3 => rng.range(0, 1),
+                                _ => rng.range(0, 3),
+                            };
+                            let drift = match settings.wind {
+                                -2 => rng.range(-2, 0),
+                                -1 => rng.range(-1, 0),
+                                0  => rng.range(-1, 1),
+                                1  => rng.range(0, 1),
+                                2  => rng.range(0, 2),
+                                _  => rng.range(-1, 1),
+                            };
+                            let nx = (x as i32 + drift).clamp(0, cols as i32 - 1) as usize;
+                            let new_val = (below as i32 - decay).max(0) as u8;
+                            grid[(y - 1) * cols + nx] = new_val;
+                        }
+                    }
+                    if elapsed > source_cool_at {
+                        for x in 0..cols {
+                            let dec = rng.range(2, 6);
+                            grid[x] = (grid[x] as i32 - dec).max(0) as u8; // top row
+                            let idx = (rows - 1) * cols + x;
+                            let dec = rng.range(2, 6);
+                            grid[idx] = (grid[idx] as i32 - dec).max(0) as u8; // bottom row
+                        }
+                    }
+                }
                 _ => {
                     // Bottom → Top: row y radiates into row y-1 (default)
                     for x in 0..cols {
@@ -423,4 +501,101 @@ pub fn burn(palette: &Palette, settings: &AnimSettings, interrupted: Arc<AtomicB
     let _ = out.flush();
 
     let _ = write!(out, "{ESC}[?25h"); // always restore cursor
+}
+
+// ── Two-sided fire helpers (direction = 4) ───────────────────────────
+
+/// How many rows the fire climbs before its heat budget runs out, per `height`.
+/// Average decay per row: 2 / 1 / 0.5 / 0 → reach = MAX_HEAT / avg_decay.
+fn fire_reach(height: i32) -> usize {
+    match height {
+        0 => MAX_HEAT as usize / 2,
+        1 => MAX_HEAT as usize,
+        2 => MAX_HEAT as usize * 2,
+        3 => usize::MAX, // zero decay: unbounded
+        _ => MAX_HEAT as usize, // unknown height behaves like the default
+    }
+}
+
+/// direction = 4 stays two-sided only when the fire cannot reach the top
+/// (rows beyond `fire_reach`); otherwise it degrades to plain bottom-up (0).
+fn normalize_direction(direction: u8, rows: usize, height: i32) -> u8 {
+    match direction {
+        4 if rows > fire_reach(height) => 4,
+        4 => 0,
+        d => d,
+    }
+}
+
+/// Row bounds of the two half-grid zones: the top zone reads sources `0..top_end`
+/// (writing rows `1..=top_end`), the bottom zone reads sources `bottom_start..rows`
+/// (writing rows `bottom_start - 1..rows - 2`). Source rows 0 and `rows - 1`
+/// are seeded by `resize_grid`; the two zones never write the same row.
+/// Shared with the palette-picker preview in `tui`.
+pub fn zone_bounds(rows: usize) -> (usize, usize) {
+    let mid = rows / 2;
+    (mid, mid + 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fire_reach_matches_average_decay_budget() {
+        assert_eq!(fire_reach(0), 18); // MAX_HEAT / 2
+        assert_eq!(fire_reach(1), 36); // MAX_HEAT / 1
+        assert_eq!(fire_reach(2), 72); // MAX_HEAT / 0.5
+        assert_eq!(fire_reach(3), usize::MAX); // zero decay: unbounded
+        assert_eq!(fire_reach(9), fire_reach(1)); // unknown → same as default
+    }
+
+    #[test]
+    fn normalize_direction_keeps_two_sided_only_when_fire_falls_short() {
+        // Fire cannot reach the top → both sources.
+        assert_eq!(normalize_direction(4, 100, 1), 4);
+        assert_eq!(normalize_direction(4, 80, 2), 4);
+        assert_eq!(normalize_direction(4, 19, 0), 4);
+        // Reaches the top exactly or with room to spare → plain bottom-up.
+        assert_eq!(normalize_direction(4, 36, 1), 0);
+        assert_eq!(normalize_direction(4, 50, 2), 0);
+        assert_eq!(normalize_direction(4, 18, 0), 0);
+        // Extreme height always reaches → never two-sided.
+        assert_eq!(normalize_direction(4, 500, 3), 0);
+        // Other directions pass through untouched.
+        assert_eq!(normalize_direction(0, 10, 1), 0);
+        assert_eq!(normalize_direction(1, 10, 1), 1);
+        assert_eq!(normalize_direction(2, 10, 1), 2);
+        assert_eq!(normalize_direction(3, 10, 1), 3);
+    }
+
+    #[test]
+    fn resize_grid_seeds_both_edges_for_two_sided() {
+        let (cols, rows) = (4, 6);
+        let grid = resize_grid(cols, rows, 4);
+        let expected = vec![MAX_HEAT; cols];
+        assert_eq!(&grid[..cols], &expected[..], "top source row must be seeded");
+        assert_eq!(&grid[(rows - 1) * cols..], &expected[..], "bottom source row must be seeded");
+        for y in 1..rows - 1 {
+            for x in 0..cols {
+                assert_eq!(grid[y * cols + x], 0, "mid rows start cold");
+            }
+        }
+    }
+
+    #[test]
+    fn zone_bounds_split_rows_without_gaps_or_write_overlaps() {
+        for rows in 4..40usize {
+            let (top_end, bottom_start) = zone_bounds(rows);
+            // Top zone covers rows 0..=top_end, bottom zone rows bottom_start-1..=rows-1:
+            // the written bands must be adjacent with no gap and no overlap.
+            assert_eq!(bottom_start, top_end + 2, "zones must be adjacent");
+            assert!(bottom_start <= rows, "bottom sources must be a valid range");
+            // The bottom source range is non-empty once there is room for a mid band.
+            assert!(bottom_start < rows || rows < 5);
+        }
+        // Concrete cases.
+        assert_eq!(zone_bounds(10), (5, 7));
+        assert_eq!(zone_bounds(11), (5, 7));
+    }
 }
